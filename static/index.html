@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NL2SQL</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161a22;
+    --border: #242a36;
+    --text: #e6e9ef;
+    --muted: #8a93a6;
+    --accent: #6ea8fe;
+    --err: #ff7b7b;
+    --ok: #5ed37a;
+    --rec: #ff4d4f;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--border); display:flex; justify-content:space-between; align-items:center; }
+  header h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: 0.3px; }
+  header .meta { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 12px; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+  textarea {
+    width: 100%; min-height: 70px; padding: 10px 12px; background: var(--panel);
+    color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    font: inherit; resize: vertical;
+  }
+  button {
+    padding: 10px 16px; background: var(--accent); color: #0b1120; border: 0;
+    border-radius: 6px; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { opacity: 0.6; cursor: not-allowed; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); font-weight: 400; }
+  button.danger { background: transparent; color: var(--err); border: 1px solid var(--border); font-weight: 400; }
+  button.icon { padding: 8px 10px; background: transparent; border: 1px solid var(--border); color: var(--muted); font-size: 16px; line-height: 1; }
+  button.icon:hover { color: var(--text); }
+  button.icon.rec { color: var(--rec); border-color: var(--rec); animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.55} }
+  .controls { display:flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .controls label { color: var(--muted); font-size: 13px; user-select: none; }
+  .spacer { flex: 1; }
+  .card { margin-top: 18px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .card h3 { margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+  pre.sql { margin: 0; padding: 14px; overflow: auto; white-space: pre-wrap; word-break: break-word; font: 13px/1.5 "SF Mono", ui-monospace, Menlo, Consolas, monospace; color: #d5daff; }
+  .explain { padding: 12px 14px; color: var(--muted); font-size: 13px; }
+  .error { color: var(--err); padding: 12px 14px; font-size: 13px; }
+  .stats { color: var(--muted); font-size: 12px; padding: 10px 14px; border-top: 1px solid var(--border); display:flex; gap:16px; flex-wrap:wrap; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th { position: sticky; top: 0; background: #1b2029; color: var(--muted); text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-weight: 600; }
+  tbody td { padding: 7px 10px; border-bottom: 1px solid #1e222c; vertical-align: top; font-family: "SF Mono", ui-monospace, monospace; font-size: 12.5px; }
+  tbody tr:hover { background: #1a1f29; }
+  .table-wrap { max-height: 520px; overflow: auto; }
+  .history .item { padding: 10px 14px; border-top: 1px solid var(--border); cursor: pointer; }
+  .history .item:first-child { border-top: 0; }
+  .history .item:hover { background: #1a1f29; }
+  .history .q { color: var(--text); }
+  .history .t { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; margin-right: 6px; }
+  .b-ok { background: #1b3a24; color: var(--ok); }
+  .b-err { background: #3a1e1e; color: var(--err); }
+  .b-active { background: #1e2d4a; color: var(--accent); }
+
+  /* Modal */
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: flex-start; justify-content: center; padding: 40px 20px; z-index: 50; overflow: auto; }
+  .modal-backdrop.open { display: flex; }
+  .modal { width: 100%; max-width: 720px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .modal header { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  .modal header h2 { margin: 0; font-size: 14px; font-weight: 600; }
+  .modal .body { padding: 14px 16px; }
+  .modal .row { display: grid; grid-template-columns: 120px 1fr; gap: 10px 14px; align-items: center; margin-bottom: 10px; }
+  .modal input { padding: 8px 10px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; font: inherit; }
+  .db-list { margin-bottom: 18px; }
+  .db-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; }
+  .db-row .name { font-weight: 600; }
+  .db-row .info { color: var(--muted); font-size: 12px; }
+  .divider { border-top: 1px solid var(--border); margin: 14px 0; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--muted); border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>NL2SQL</h1>
+  <div class="meta">
+    <span id="meta">loading…</span>
+    <button class="ghost" id="retrain" title="Retrain intent classifier from history">Retrain</button>
+    <button class="icon" id="openSettings" title="Database settings">⚙</button>
+  </div>
+</header>
+<main>
+  <textarea id="q" placeholder="Ask in English, e.g. 'How many active employees does each client have?'"></textarea>
+  <div class="controls">
+    <button id="run">Run</button>
+    <button class="ghost" id="gen">Show SQL only</button>
+    <button class="icon" id="mic" title="Voice input (hold Space to talk)">🎙</button>
+    <span id="micStatus" style="color: var(--muted); font-size: 12px;"></span>
+    <div class="spacer"></div>
+    <label><input type="checkbox" id="showSql" checked /> Show generated SQL</label>
+    <span id="status" style="color: var(--muted);"></span>
+  </div>
+
+  <div id="out"></div>
+
+  <div style="margin-top: 22px;">
+    <h3 style="color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; margin: 18px 0 8px;">Recent queries</h3>
+    <div class="card history" id="hist"></div>
+  </div>
+</main>
+
+<!-- Settings modal -->
+<div class="modal-backdrop" id="settingsBackdrop">
+  <div class="modal">
+    <header>
+      <h2>Databases</h2>
+      <button class="icon" id="closeSettings">✕</button>
+    </header>
+    <div class="body">
+      <div id="dbList" class="db-list"></div>
+      <div class="divider"></div>
+      <h3 style="margin: 0 0 10px; font-size: 13px; color: var(--muted);">Add a new database</h3>
+      <div class="row"><label for="f-name">Display name</label><input id="f-name" placeholder="e.g. prod-analytics" /></div>
+      <div class="row"><label for="f-host">Host</label><input id="f-host" placeholder="host.docker.internal (for DBs on your laptop or via SSH tunnel)" /></div>
+      <div class="row"><label for="f-port">Port</label><input id="f-port" type="number" value="5432" /></div>
+      <div class="row"><label for="f-dbname">Database</label><input id="f-dbname" placeholder="postgres" /></div>
+      <div class="row"><label for="f-user">Username</label><input id="f-user" /></div>
+      <div class="row"><label for="f-pass">Password</label><input id="f-pass" type="password" /></div>
+      <div style="display: flex; gap: 8px; align-items: center; margin-top: 10px;">
+        <button id="addDb">Test & Add</button>
+        <label style="display:flex; align-items:center; gap: 6px;"><input type="checkbox" id="f-activate" checked /> <span style="color: var(--muted); font-size: 13px;">activate on add</span></label>
+        <span id="addStatus" style="color: var(--muted); font-size: 12px;"></span>
+      </div>
+      <p class="note">
+        <strong>Host tip:</strong> the app runs in a container, so <code>localhost</code>/<code>127.0.0.1</code>
+        refer to the container, not your laptop. Use <code>host.docker.internal</code> for DBs on your
+        machine or via an SSH tunnel. (We'll auto-translate loopback hosts for you.)
+        <br/>
+        <br/>
+        Adding a database introspects its schema into a DSL file. Usually completes in a few seconds;
+        larger schemas (hundreds of tables) may take 10-30 seconds.
+      </p>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+
+async function fetchJSON(url, opts) {
+  const res = await fetch(url, opts);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.detail || res.statusText);
+  return body;
+}
+
+function escape(s) {
+  return s.replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+}
+
+function renderTable(cols, rows) {
+  if (!rows || !rows.length) return '<div class="explain">No rows returned.</div>';
+  const head = cols.map((c) => `<th>${escape(c)}</th>`).join('');
+  const body = rows
+    .map((r) => `<tr>${r.map((v) => `<td>${v === null ? '<i style="color:#555">null</i>' : escape(String(v))}</td>`).join('')}</tr>`)
+    .join('');
+  return `<div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function renderResult(r) {
+  const parts = [];
+  if (r.error) parts.push(`<div class="card"><h3>Error</h3><div class="error">${escape(r.error)}</div></div>`);
+  if (r.explanation) parts.push(`<div class="card"><h3>Explanation</h3><div class="explain">${escape(r.explanation)}</div></div>`);
+  if (r.sql && $('#showSql').checked) parts.push(`<div class="card"><h3>SQL</h3><pre class="sql">${escape(r.sql)}</pre></div>`);
+  if (r.columns && r.columns.length) {
+    parts.push(`<div class="card"><h3>Results${r.truncated ? ' (truncated)' : ''}</h3>${renderTable(r.columns, r.rows)}
+      <div class="stats">
+        <span>${r.row_count} row${r.row_count === 1 ? '' : 's'}</span>
+        <span>${r.elapsed_ms} ms</span>
+        <span>tables: ${(r.tables_used||[]).join(', ') || '—'}</span>
+        <span>intent: ${escape(r.intent||'—')}</span>
+        <span>confidence: ${(r.confidence*100).toFixed(0)}%</span>
+      </div></div>`);
+  }
+  $('#out').innerHTML = parts.join('');
+}
+
+async function ask(execute) {
+  const question = $('#q').value.trim();
+  if (!question) return;
+  $('#run').disabled = true;
+  $('#gen').disabled = true;
+  $('#status').textContent = 'thinking…';
+  try {
+    const r = await fetchJSON('/api/ask', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ question, execute }),
+    });
+    renderResult(r);
+    loadHistory();
+  } catch (e) {
+    $('#out').innerHTML = `<div class="card"><h3>Error</h3><div class="error">${escape(e.message)}</div></div>`;
+  } finally {
+    $('#run').disabled = false;
+    $('#gen').disabled = false;
+    $('#status').textContent = '';
+  }
+}
+
+async function loadHistory() {
+  try {
+    const h = await fetchJSON('/api/history?limit=20');
+    $('#hist').innerHTML = h.items.map((it) => `
+      <div class="item" data-q="${escape(it.question)}">
+        <div class="q"><span class="badge ${it.status==='ok'?'b-ok':'b-err'}">${it.status}</span>${escape(it.question)}</div>
+        <div class="t">${it.created_at} · ${it.row_count ?? '—'} rows · ${it.elapsed_ms ?? '—'} ms</div>
+      </div>`).join('') || '<div class="explain">No history yet.</div>';
+    document.querySelectorAll('.history .item').forEach((el) => {
+      el.onclick = () => { $('#q').value = el.dataset.q; window.scrollTo({ top: 0, behavior: 'smooth' }); };
+    });
+  } catch {}
+}
+
+async function loadMeta() {
+  try {
+    const h = await fetchJSON('/api/health');
+    const trained = h.model_trained ? 'trained' : 'untrained';
+    $('#meta').textContent = `db: ${h.active_db} · tables: ${h.tables} · ${h.model} (${trained})`;
+  } catch (e) { $('#meta').textContent = 'offline'; }
+}
+
+async function retrain() {
+  const btn = $('#retrain');
+  if (!btn) return;
+  btn.disabled = true;
+  const label = btn.textContent;
+  btn.innerHTML = '<span class="spinner"></span>training…';
+  try {
+    const r = await fetchJSON('/api/train', { method: 'POST' });
+    btn.textContent = `trained ${r.total_unique} ex.`;
+    setTimeout(() => { btn.textContent = label; btn.disabled = false; }, 2500);
+    await loadMeta();
+  } catch (e) {
+    btn.textContent = label; btn.disabled = false;
+    alert(e.message);
+  }
+}
+
+// ---------- Voice to text ----------
+
+const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognizer = null;
+let recognizing = false;
+
+if (!SpeechRec) {
+  $('#mic').title = 'Voice input not supported in this browser';
+  $('#mic').style.opacity = 0.4;
+} else {
+  recognizer = new SpeechRec();
+  recognizer.continuous = false;
+  recognizer.interimResults = true;
+  recognizer.lang = navigator.language || 'en-US';
+
+  let baseText = '';
+  recognizer.onstart = () => {
+    recognizing = true;
+    baseText = $('#q').value;
+    if (baseText && !baseText.endsWith(' ')) baseText += ' ';
+    $('#mic').classList.add('rec');
+    $('#micStatus').textContent = 'listening…';
+  };
+  recognizer.onresult = (ev) => {
+    let finals = '', interims = '';
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const r = ev.results[i];
+      if (r.isFinal) finals += r[0].transcript;
+      else interims += r[0].transcript;
+    }
+    $('#q').value = baseText + finals + interims;
+  };
+  recognizer.onerror = (ev) => {
+    $('#micStatus').textContent = `mic: ${ev.error}`;
+  };
+  recognizer.onend = () => {
+    recognizing = false;
+    $('#mic').classList.remove('rec');
+    $('#micStatus').textContent = '';
+  };
+}
+
+function toggleMic() {
+  if (!recognizer) return;
+  if (recognizing) recognizer.stop();
+  else { try { recognizer.start(); } catch {} }
+}
+
+$('#mic').onclick = toggleMic;
+
+// Hold-space to talk (convenient when textarea isn't focused)
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && e.target !== $('#q') && !recognizing && recognizer) {
+    e.preventDefault(); recognizer.start();
+  }
+});
+document.addEventListener('keyup', (e) => {
+  if (e.code === 'Space' && recognizing) { e.preventDefault(); recognizer.stop(); }
+});
+
+// ---------- Database settings modal ----------
+
+async function loadDbList() {
+  const { items } = await fetchJSON('/api/databases');
+  if (!items.length) {
+    $('#dbList').innerHTML = '<div class="explain" style="padding: 10px 0;">No databases configured. The app is using its fallback env-based connection. Add one below to manage multiple.</div>';
+    return;
+  }
+  $('#dbList').innerHTML = items.map((it) => `
+    <div class="db-row">
+      <div style="flex:1;">
+        <div class="name">${escape(it.name)} ${it.is_active ? '<span class="badge b-active">active</span>' : ''}</div>
+        <div class="info">${escape(it.username)}@${escape(it.host)}:${it.port}/${escape(it.dbname)} · ${it.table_count} tables</div>
+      </div>
+      ${it.is_active ? '' : `<button class="ghost" data-act="activate" data-name="${escape(it.name)}">Activate</button>`}
+      <button class="ghost" data-act="regenerate" data-name="${escape(it.name)}">Regenerate</button>
+      <button class="danger" data-act="delete" data-name="${escape(it.name)}">Delete</button>
+    </div>`).join('');
+  document.querySelectorAll('#dbList button').forEach((b) => {
+    b.onclick = () => dbAction(b.dataset.act, b.dataset.name, b);
+  });
+}
+
+async function dbAction(act, name, btn) {
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spinner"></span>${act === 'regenerate' ? 'regenerating…' : act + '…'}`;
+  try {
+    if (act === 'activate') await fetchJSON(`/api/databases/${encodeURIComponent(name)}/activate`, { method: 'POST' });
+    else if (act === 'regenerate') await fetchJSON(`/api/databases/${encodeURIComponent(name)}/regenerate`, { method: 'POST' });
+    else if (act === 'delete') {
+      if (!confirm(`Remove database config '${name}'? (Does not touch the actual database.)`)) {
+        btn.disabled = false; btn.textContent = label; return;
+      }
+      await fetchJSON(`/api/databases/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    }
+    await Promise.all([loadDbList(), loadMeta()]);
+  } catch (e) {
+    alert(e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
+}
+
+$('#openSettings').onclick = async () => {
+  $('#settingsBackdrop').classList.add('open');
+  await loadDbList();
+};
+$('#closeSettings').onclick = () => $('#settingsBackdrop').classList.remove('open');
+$('#settingsBackdrop').onclick = (e) => { if (e.target === $('#settingsBackdrop')) $('#settingsBackdrop').classList.remove('open'); };
+
+$('#addDb').onclick = async () => {
+  const payload = {
+    name: $('#f-name').value.trim(),
+    host: $('#f-host').value.trim(),
+    port: parseInt($('#f-port').value, 10),
+    dbname: $('#f-dbname').value.trim(),
+    username: $('#f-user').value.trim(),
+    password: $('#f-pass').value,
+    activate: $('#f-activate').checked,
+  };
+  if (!payload.name || !payload.host || !payload.dbname || !payload.username) {
+    $('#addStatus').textContent = 'fill all required fields'; return;
+  }
+  $('#addDb').disabled = true;
+  $('#addStatus').innerHTML = '<span class="spinner"></span>connecting & introspecting schema…';
+  try {
+    await fetchJSON('/api/databases', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    ['f-name','f-host','f-port','f-dbname','f-user','f-pass'].forEach((id) => {
+      if (id === 'f-port') $('#'+id).value = 5432;
+      else $('#'+id).value = '';
+    });
+    $('#addStatus').textContent = 'added ✓';
+    await Promise.all([loadDbList(), loadMeta()]);
+  } catch (e) {
+    $('#addStatus').innerHTML = `<span style="color: var(--err);">${escape(e.message)}</span>`;
+  } finally {
+    $('#addDb').disabled = false;
+    setTimeout(() => { if ($('#addStatus').textContent === 'added ✓') $('#addStatus').textContent = ''; }, 3000);
+  }
+};
+
+// ---------- Wiring ----------
+
+$('#run').onclick = () => ask(true);
+$('#gen').onclick = () => ask(false);
+$('#retrain').onclick = retrain;
+$('#q').addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') ask(true);
+});
+
+loadMeta();
+loadHistory();
+</script>
+</body>
+</html>

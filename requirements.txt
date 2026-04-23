@@ -1,0 +1,14 @@
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+pydantic-settings==2.6.0
+python-dotenv==1.0.1
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+sqlglot==25.28.0
+pyyaml==6.0.2
+scikit-learn==1.5.2
+rapidfuzz==3.10.1
+nltk==3.9.1
+joblib==1.4.2
+dateparser==1.2.0

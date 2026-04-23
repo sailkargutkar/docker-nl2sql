@@ -1,0 +1,18 @@
+services:
+  nl2sql:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nl2sql-app
+    ports:
+      - "8010:8010"
+    env_file: .env
+    volumes:
+      - ./:/app
+      - nl2sql_data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  nl2sql_data:
