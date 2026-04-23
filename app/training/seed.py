@@ -26,6 +26,11 @@ SEED: list[tuple[str, str]] = [
     ("how many trips were completed", "count"),
     ("how many clients are enabled", "count"),
     ("count rows in the drivers table", "count"),
+    ("total users in org swaraj", "count"),
+    ("total employees belonging to client acme", "count"),
+    ("total drivers for organization foo", "count"),
+    ("total contact persons of client", "count"),
+    ("total tours for client bar", "count"),
 
     # list / select
     ("show me all clients", "list"),

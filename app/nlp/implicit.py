@@ -1,0 +1,168 @@
+"""
+Implicit value detection: unquoted proper nouns like "org swaraj" or
+"client acme" where a schema-matching word introduces a value literal for the
+named entity.
+
+Patterns recognised:
+  "org swaraj"           → Organization.name = 'swaraj'
+  "client acme"          → Client.name = 'acme'
+  "for client acme"      → Client.name = 'acme'
+  "named swaraj"         → <inferred table>.name = 'swaraj'
+  "employee john doe"    → Employee.name = 'john doe'  (multi-word value)
+
+Emits *hints* — the builder still validates that the hinted table has a
+reasonable name-like column, and falls back silently if not.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from ..schema_dsl import Schema
+from .matcher import _split_identifier
+from .preprocess import Preprocessed, _lemma
+
+
+_INTRO_WORDS = {"named", "called", "name", "with"}
+_CONNECTIVE_WORDS = {"for", "of", "in", "at", "to", "by", "belongs", "belong", "from"}
+
+
+@dataclass
+class ImplicitValue:
+    table_hint: str
+    value: str
+
+
+_MIN_PREFIX = 3  # "org" → "organization"; avoids "id" → "invoice"
+
+
+def _register_alias(target: dict[str, str], key: str, table: str) -> None:
+    """Ambiguous keys map to "" sentinel — treated as no-hint."""
+    if key in target and target[key] != table:
+        target[key] = ""
+    elif key not in target:
+        target[key] = table
+
+
+def _known_lemmas(schema: Schema) -> tuple[set[str], dict[str, str]]:
+    """Return (all-known-schema-lemmas, lemma-to-table-if-unique).
+
+    Table-name lemmas AND meaningful prefixes (>= 3 chars) both register as
+    table hints, so 'org' resolves to 'Organization', 'emp' to 'Employee'.
+    """
+    all_lemmas: set[str] = set()
+    table_by_lemma: dict[str, str] = {}
+    # Always collect all schema lemmas (from tables and columns) so values
+    # aren't misidentified as literals. Register both split parts AND the
+    # joined-lowercase form so e.g. "paymentTerm" (tokenized as one word)
+    # still resolves.
+    for t in schema.tables:
+        parts = _split_identifier(t.name)
+        for part in parts:
+            all_lemmas.add(part)
+        all_lemmas.add(t.name.lower())
+        all_lemmas.add("".join(parts))
+        for c in t.columns:
+            col_parts = _split_identifier(c.name)
+            for part in col_parts:
+                all_lemmas.add(part)
+            all_lemmas.add(c.name.lower())
+            all_lemmas.add("".join(col_parts))
+
+    # Register table hints in two passes, root entities winning over compound
+    # tables. "Organization" claims "organization" and prefix "org" before
+    # "UserOrg" (compound) has any chance — so "org swaraj" → Organization,
+    # not UserOrg.
+    single_part_tables = [
+        t for t in schema.tables if len(_split_identifier(t.name)) == 1
+    ]
+    multi_part_tables = [
+        t for t in schema.tables if len(_split_identifier(t.name)) > 1
+    ]
+
+    # Pass 1: root (1-part) tables claim their name AND their prefixes.
+    for t in sorted(single_part_tables, key=lambda x: len(x.name)):
+        word = _split_identifier(t.name)[0]
+        _register_alias(table_by_lemma, word, t.name)
+        for plen in range(_MIN_PREFIX, len(word)):
+            prefix = word[:plen]
+            if prefix not in table_by_lemma:
+                table_by_lemma[prefix] = t.name
+                all_lemmas.add(prefix)
+
+    # Pass 2: compound tables claim each of their parts only if still free.
+    for t in multi_part_tables:
+        for part in _split_identifier(t.name):
+            if part not in table_by_lemma:
+                table_by_lemma[part] = t.name
+            elif table_by_lemma[part] != t.name:
+                # Collision — mark ambiguous so neither wins.
+                # But only if the existing claim is ALSO a compound, otherwise
+                # a root table's claim stays.
+                existing = table_by_lemma[part]
+                existing_parts = _split_identifier(existing)
+                if len(existing_parts) > 1:
+                    table_by_lemma[part] = ""  # ambiguous sentinel
+    # Drop ambiguous sentinels AND remove any leftover empty string keys.
+    table_by_lemma = {k: v for k, v in table_by_lemma.items() if v}
+    return all_lemmas, table_by_lemma
+
+
+def detect(pre: Preprocessed, schema: Schema) -> list[ImplicitValue]:
+    all_lemmas, table_by_lemma = _known_lemmas(schema)
+
+    tokens = [t for t in pre.tokens if not t.is_quoted]
+    out: list[ImplicitValue] = []
+
+    def _is_value_candidate(token_index: int) -> bool:
+        """A token is a value candidate if it doesn't match any schema entity
+        and isn't a structural word."""
+        t = tokens[token_index]
+        if t.lemma in all_lemmas:
+            return False
+        if t.raw.isdigit():
+            return False
+        if t.lemma in _INTRO_WORDS or t.lemma in _CONNECTIVE_WORDS:
+            return False
+        return True
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+
+        # Pattern 1: <table-word> <value>
+        table = table_by_lemma.get(tok.lemma)
+        if table and i + 1 < len(tokens) and _is_value_candidate(i + 1):
+            value_parts = [tokens[i + 1].raw]
+            j = i + 2
+            while j < len(tokens) and _is_value_candidate(j):
+                value_parts.append(tokens[j].raw)
+                j += 1
+            out.append(ImplicitValue(table_hint=table, value=" ".join(value_parts)))
+            i = j
+            continue
+
+        # Pattern 2: named/called <value> — inferred table from context.
+        if tok.lemma in _INTRO_WORDS and i + 1 < len(tokens) and _is_value_candidate(i + 1):
+            # Look *backwards* for the most recent table word to attach to.
+            hint = None
+            for k in range(i - 1, max(i - 4, -1), -1):
+                cand_table = table_by_lemma.get(tokens[k].lemma)
+                if cand_table:
+                    hint = cand_table
+                    break
+            if hint is None:
+                i += 1
+                continue
+            value_parts = [tokens[i + 1].raw]
+            j = i + 2
+            while j < len(tokens) and _is_value_candidate(j):
+                value_parts.append(tokens[j].raw)
+                j += 1
+            out.append(ImplicitValue(table_hint=hint, value=" ".join(value_parts)))
+            i = j
+            continue
+
+        i += 1
+
+    return out

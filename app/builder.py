@@ -18,6 +18,7 @@ from typing import Any
 
 from sqlglot import exp
 
+from .nlp.implicit import ImplicitValue
 from .nlp.matcher import ColumnMatch, resolve_join_path
 from .nlp.values import ExtractedValues
 from .schema_dsl import Column, Schema, Table
@@ -106,6 +107,25 @@ def _find_column(schema: Schema, table: str, col: str) -> Column | None:
     return None
 
 
+_NAME_LIKE = ("name", "title", "label", "code", "username", "email", "fullname")
+
+
+def _name_like_column(schema: Schema, table: str) -> Column | None:
+    """Return the best 'name' column for binding an unquoted literal."""
+    t = _lookup(schema, table)
+    if t is None:
+        return None
+    for candidate in _NAME_LIKE:
+        for c in t.columns:
+            if c.name.lower() == candidate:
+                return c
+    # Fall back: first string-typed column that isn't an id.
+    for c in t.columns:
+        if _is_string(c) and not c.name.lower().endswith("id"):
+            return c
+    return None
+
+
 def _default_list_columns(schema: Schema, table: str, max_cols: int = 6) -> list[str]:
     """For a LIST intent with no explicit columns, pick sensible defaults."""
     t = _lookup(schema, table)
@@ -134,73 +154,137 @@ def _default_list_columns(schema: Schema, table: str, max_cols: int = 6) -> list
 
 def _build_where(
     schema: Schema,
-    table: str,
+    primary: str,
     columns: list[ColumnMatch],
     values: ExtractedValues,
-) -> tuple[exp.Expression | None, list[str]]:
-    """Construct a WHERE tree from available (column-match, value) pairs.
+    implicit_values: list[ImplicitValue],
+) -> tuple[exp.Expression | None, list[str], list[str]]:
+    """Construct WHERE from matched columns + typed values + implicit literals.
 
-    Matching strategy is order-insensitive and greedy: each value is assigned to
-    the highest-scoring column whose type accepts that value's python type.
+    Returns (where_expr, used_column_refs, extra_tables).
+      - `used_column_refs` is "Table.col" per binding (for the explanation).
+      - `extra_tables` is the set of secondary tables the WHERE references;
+        the caller joins them before emitting SQL.
     """
     conditions: list[exp.Expression] = []
     used: list[str] = []
+    extra_tables: list[str] = []
 
-    cand = [m for m in columns if m.table == table]
+    def _record(table: str, col: str, expr: exp.Expression) -> None:
+        conditions.append(expr)
+        used.append(f"{table}.{col}")
+        if table.lower() != primary.lower() and table not in extra_tables:
+            extra_tables.append(table)
 
-    # Quoted strings → string/uuid columns.
+    # Implicit values first — highest signal: user named an entity explicitly.
+    for iv in implicit_values:
+        name_col = _name_like_column(schema, iv.table_hint)
+        if name_col is None:
+            continue
+        _record(
+            iv.table_hint,
+            name_col.name,
+            exp.EQ(
+                this=_column_ref(iv.table_hint, name_col.name),
+                expression=_literal(iv.value),
+            ),
+        )
+
+    # Quoted strings → prefer primary-table string columns, fall back to any.
+    primary_cols = [m for m in columns if m.table.lower() == primary.lower()]
+    any_cols = columns
     for qv in list(values.quoted):
-        for m in cand:
-            c = _find_column(schema, m.table, m.column)
-            if c and (_is_string(c) or c.name in used):
-                if m.column in used:
+        bound = False
+        for pool in (primary_cols, any_cols):
+            for m in pool:
+                if f"{m.table}.{m.column}" in used:
                     continue
-                if _is_string(c):
-                    conditions.append(
-                        exp.EQ(this=_column_ref(m.table, m.column), expression=_literal(qv))
+                c = _find_column(schema, m.table, m.column)
+                if c and _is_string(c):
+                    _record(
+                        m.table,
+                        m.column,
+                        exp.EQ(
+                            this=_column_ref(m.table, m.column),
+                            expression=_literal(qv),
+                        ),
                     )
-                    used.append(m.column)
+                    bound = True
                     break
+            if bound:
+                break
 
-    # Booleans → boolean columns.
+    # Booleans → primary boolean columns only (cross-table booleans are too
+    # ambiguous to guess).
     for b in list(values.booleans):
-        for m in cand:
+        for m in primary_cols:
+            if f"{m.table}.{m.column}" in used:
+                continue
             c = _find_column(schema, m.table, m.column)
-            if c and _is_boolean(c) and m.column not in used:
-                conditions.append(
-                    exp.EQ(this=_column_ref(m.table, m.column), expression=_literal(b))
+            if c and _is_boolean(c):
+                _record(
+                    m.table,
+                    m.column,
+                    exp.EQ(
+                        this=_column_ref(m.table, m.column),
+                        expression=_literal(b),
+                    ),
                 )
-                used.append(m.column)
                 break
 
-    # Dates → date/timestamp columns (default to =; later: range-phrase detection).
+    # Dates → date/timestamp columns on any matched table.
     for d in list(values.dates):
-        for m in cand:
-            c = _find_column(schema, m.table, m.column)
-            if c and _is_date(c) and m.column not in used:
-                conditions.append(
-                    exp.EQ(this=_column_ref(m.table, m.column), expression=_literal(d))
-                )
-                used.append(m.column)
+        bound = False
+        for pool in (primary_cols, any_cols):
+            for m in pool:
+                if f"{m.table}.{m.column}" in used:
+                    continue
+                c = _find_column(schema, m.table, m.column)
+                if c and _is_date(c):
+                    _record(
+                        m.table,
+                        m.column,
+                        exp.EQ(
+                            this=_column_ref(m.table, m.column),
+                            expression=_literal(d),
+                        ),
+                    )
+                    bound = True
+                    break
+            if bound:
                 break
 
-    # Integers/numbers → numeric columns.
-    for n in list(values.integers) + [int(x) for x in values.numbers if x.is_integer()]:
-        for m in cand:
-            c = _find_column(schema, m.table, m.column)
-            if c and _is_numeric(c) and m.column not in used:
-                conditions.append(
-                    exp.EQ(this=_column_ref(m.table, m.column), expression=_literal(n))
-                )
-                used.append(m.column)
+    # Numerics → any matched numeric column.
+    numeric_inputs = list(values.integers) + [
+        int(x) for x in values.numbers if x.is_integer()
+    ]
+    for n in numeric_inputs:
+        bound = False
+        for pool in (primary_cols, any_cols):
+            for m in pool:
+                if f"{m.table}.{m.column}" in used:
+                    continue
+                c = _find_column(schema, m.table, m.column)
+                if c and _is_numeric(c):
+                    _record(
+                        m.table,
+                        m.column,
+                        exp.EQ(
+                            this=_column_ref(m.table, m.column),
+                            expression=_literal(n),
+                        ),
+                    )
+                    bound = True
+                    break
+            if bound:
                 break
 
     if not conditions:
-        return None, used
+        return None, used, extra_tables
     combined = conditions[0]
     for cond in conditions[1:]:
         combined = exp.And(this=combined, expression=cond)
-    return combined, used
+    return combined, used, extra_tables
 
 
 def _first_numeric_column(matches: list[ColumnMatch], schema: Schema) -> ColumnMatch | None:
@@ -285,7 +369,9 @@ def build(
     column_matches: list[ColumnMatch],
     values: ExtractedValues,
     max_rows: int,
+    implicit_values: list[ImplicitValue] | None = None,
 ) -> BuildResult:
+    implicit_values = implicit_values or []
     primary = _primary_table(table_scores, column_matches)
     if primary is None:
         raise BuildError(
@@ -368,12 +454,16 @@ def build(
                     select = select.select(_column_ref(primary, c), copy=False)
         explanation_bits.append(f"list from {primary}")
 
-    # WHERE — restrict to primary-table columns. Cross-table filters would
-    # explode the join graph; we keep the builder tight and deterministic.
-    where, used_for_where = _build_where(schema, primary, column_matches, values)
+    # WHERE — cross-table allowed. Any secondary tables the WHERE touches get
+    # added to `referenced_tables` before joins are resolved.
+    where, used_for_where, extra_where_tables = _build_where(
+        schema, primary, column_matches, values, implicit_values
+    )
     if where is not None:
         select = select.where(where, copy=False)
         explanation_bits.append("filtered by " + ", ".join(used_for_where))
+    for t in extra_where_tables:
+        referenced_tables.add(t)
 
     # Now compute joins based solely on tables actually referenced.
     select = select.from_(exp.Table(this=_quoted_ident(primary)), copy=False)

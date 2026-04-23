@@ -44,5 +44,14 @@ def schema() -> Schema:
                     Column(name="hiredAt", type="date"),
                 ],
             ),
+            Table(
+                name="User",
+                description="Registered users",
+                columns=[
+                    Column(name="id", type="uuid", pk=True),
+                    Column(name="name", type="string"),
+                    Column(name="OrganizationId", type="uuid", fk="Organization.id"),
+                ],
+            ),
         ],
     )

@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass, field
 
 from .builder import BuildError, build
+from .nlp.implicit import detect as detect_implicit
 from .nlp.intent import INTENT_LABELS, IntentClassifier
 from .nlp.matcher import score_columns, score_tables
 from .nlp.preprocess import preprocess
@@ -40,7 +41,11 @@ class GenerationResult:
 
 _FALLBACK_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(how many|count( of)?|number of)\b", re.I), "count"),
-    (re.compile(r"\b(total|sum of|aggregate)\b", re.I), "sum"),
+    # "total users" (plural, no numeric column ahead) means count. We bias this
+    # before `sum` so "total X <plural>" doesn't always resolve to sum. A later
+    # override downgrades it to sum if a numeric column is clearly referenced.
+    (re.compile(r"\btotal\s+\w+s\b", re.I), "count"),
+    (re.compile(r"\b(sum of|aggregate|total)\b", re.I), "sum"),
     (re.compile(r"\b(average|avg|mean)\b", re.I), "avg"),
     (re.compile(r"\b(lowest|earliest|min(imum)?|smallest|first)\b", re.I), "min"),
     (re.compile(r"\b(highest|latest|max(imum)?|largest|most recent)\b", re.I), "max"),
@@ -72,6 +77,26 @@ def reset_classifier() -> None:
         _singleton.reload()
 
 
+_TOTAL_PLURAL_RE = re.compile(r"\btotal\s+([A-Za-z]+s)\b", re.I)
+
+
+def _override_intent_for_total(intent: str, question: str, column_matches) -> str:
+    """If the question is 'total <plural-noun>' and no numeric column scored
+    high, prefer `count` over `sum`/`list`. Covers 'total users belongs to
+    org swaraj' without hand-labelling every phrasing.
+    """
+    if not _TOTAL_PLURAL_RE.search(question):
+        return intent
+    if intent == "count":
+        return intent
+    has_strong_numeric_match = any(
+        m.score >= 8.0 and m.reason == "exact" for m in column_matches
+    )
+    if has_strong_numeric_match:
+        return intent  # user really did mean "total <numeric column>"
+    return "count"
+
+
 def generate_sql(
     question: str,
     schema: Schema,
@@ -80,6 +105,7 @@ def generate_sql(
 ) -> GenerationResult:
     pre = preprocess(question)
     values = extract(question, pre.quoted_literals)
+    implicit_values = detect_implicit(pre, schema)
 
     clf = get_classifier(intent_model_path)
     prediction = clf.predict(question) if clf.available else None
@@ -106,6 +132,16 @@ def generate_sql(
             table_scores.append((m.table, m.score / 2))
             known_tables.add(m.table)
 
+    # Implicit-value tables also bias the primary pick: if "org swaraj" pointed
+    # at Organization but Organization wasn't scored yet, seed it so the join
+    # path is reachable from whichever primary table we pick.
+    for iv in implicit_values:
+        if iv.table_hint not in known_tables:
+            table_scores.append((iv.table_hint, 1.0))
+            known_tables.add(iv.table_hint)
+
+    intent = _override_intent_for_total(intent, question, column_matches)
+
     try:
         result = build(
             intent=intent,
@@ -114,6 +150,7 @@ def generate_sql(
             column_matches=column_matches,
             values=values,
             max_rows=max_rows,
+            implicit_values=implicit_values,
         )
     except BuildError as e:
         return GenerationResult(
