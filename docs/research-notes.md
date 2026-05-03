@@ -934,6 +934,154 @@ If it works → build the rest. If it doesn't → we know the bottleneck
 before committing more time.
 
 **Prerequisites**:
-1. `OPENAI_API_KEY` in dev shell or `.env`
+1. `OPENAI_API_KEY` in `.env` or `.claude/.env` (both supported)
 2. OK to send schema metadata (table/column names) to OpenAI
 3. Trial slice of 5 tables agreed
+
+---
+
+## Tool design — final, error-checked
+
+Detailed design for the LLM-as-build-oracle tools, after design review
+and corrections. Every flag, file, and behaviour spelled out.
+
+### Bugs caught during review (and fixed)
+
+| # | Issue | Fix |
+|---|---|---|
+| 1 | `python-dotenv` was set to read `.env` only — but key may live at `.claude/.env` | Tool searches both locations, picks first hit |
+| 2 | `openai`, `ruamel.yaml`, `tiktoken` not in any requirements file | New `tools/requirements.txt`, separate from main; production image stays LLM-free |
+| 3 | `PyYAML` round-trip destroys comments in schema YAML | Tool uses `ruamel.yaml`; runtime keeps PyYAML |
+| 4 | No defined merge flow for approved annotations → risk of overwriting curated content | Tool writes to `schema/<name>.proposed.yml`; separate `apply_annotations.py` shows diff and merges on confirm |
+| 5 | Cache key was just prompt content → stale results when prompt template changes | Cache key = `sha256(prompt + model + prompt_template_version)`; bump version on template change |
+
+### Risks documented (mitigations in code)
+
+| # | Risk | Mitigation |
+|---|---|---|
+| 6 | LLM generates bad synonyms (`id` for everything) | Sanity checks: not another column on same table, length ≥ 2, not stopword |
+| 7 | SSH disconnect kills long-running tool | `nohup … &` pattern documented; pidfile + clean exit codes; `--watch` auto-detaches |
+| 8 | Cost overrun if model misset to gpt-4o | Print estimate before calls; refuse if over `--max-cost` (default $1) |
+| 9 | LLM JSON parse failure | `response_format=json_object` + Pydantic validation + 1 stricter retry |
+| 10 | GitHub secret-scanning auto-revoke (after the two leaked keys) | Documented; check OpenAI dashboard for "auto-revoked" notices |
+| 11 | Existing hand-curated synonyms get overwritten | `--mode merge` (default) preserves existing; `--mode replace` opt-in |
+| 12 | Concurrent runs corrupt cache | PID lockfile at `tools/.cache/<tool>.lock` |
+
+### File layout
+
+```
+docker-nl2sql/
+├── tools/
+│   ├── __init__.py
+│   ├── _common.py                  # env (.env OR .claude/.env), client, cache, cost meter, redaction
+│   ├── _prompts.py                 # versioned prompt templates
+│   ├── _validate.py                # Pydantic schemas + sanity checks
+│   ├── annotate_schema.py          # CLI: enrich DSL
+│   ├── apply_annotations.py        # CLI: review .proposed.yml → merge
+│   ├── generate_seed.py            # CLI: ~500 (question, intent) pairs
+│   ├── generate_benchmark.py       # CLI: 50 (question, expected_sql) pairs
+│   ├── active_label.py             # daemon: label uncertain history rows
+│   ├── diagnose_failure.py         # batch: weekly failure analysis
+│   ├── requirements.txt            # openai, ruamel.yaml, tiktoken — DEV ONLY
+│   ├── README.md                   # security + usage docs
+│   └── .cache/                     # gitignored response cache
+└── .claude/.env                    # OPENAI_API_KEY lives here (gitignored)
+```
+
+### CLI surface
+
+```bash
+tools/annotate_schema.py
+  --schema PATH                # default: schema/tmt_schema.yml
+  --tables LIST                # comma-separated, or 'all'. default: all
+  --out PATH                   # default: schema/<name>.proposed.yml
+  --model MODEL                # default: gpt-4o-mini
+  --batch-size N               # tables per LLM call. default: 5
+  --with-samples/--no-samples  # query DB for distinct values. default: with
+  --sample-size N              # values per column. default: 5
+  --max-value-len N            # truncate sample value chars. default: 30
+  --redact                     # send sanitized names; map back locally
+  --max-cost USD               # refuse if estimate exceeds. default: 1.0
+  --mode merge|replace         # default: merge
+  --concurrency N              # parallel API calls. default: 3
+  --dry-run                    # estimate cost, don't call API
+```
+
+Same pattern for `generate_seed.py`, `generate_benchmark.py`, etc. with
+their tool-specific flags.
+
+### Backend-friendly run patterns
+
+```bash
+# Foreground, one-shot:
+python tools/annotate_schema.py --tables Client,Organization,Employee,Tour,Invoice
+
+# Detached (survives SSH disconnect):
+nohup python tools/annotate_schema.py --tables all \
+      > tools/.cache/annotate.log 2>&1 &
+
+# Active-labeling daemon (poll history.db every 5 min):
+nohup python tools/active_label.py --watch 300 \
+      > tools/.cache/active.log 2>&1 &
+
+# Cron — weekly failure diagnosis:
+0 2 * * 0  cd /home/.../docker-nl2sql && \
+           python tools/diagnose_failure.py \
+           >> tools/.cache/diagnose.log 2>&1
+```
+
+### Cost estimate — corrected
+
+For `tmt_schema.yml` (93 tables, ~700 columns), `gpt-4o-mini`:
+
+| Action | Tokens in | Tokens out | Cost | Wall time |
+|---|---|---|---|---|
+| Annotate 5-table trial | ~7 K | ~5 K | $0.005 | ~5 s |
+| Annotate full schema (batched 5/call, 3 parallel) | ~120 K | ~80 K | $0.07 | ~60 s |
+| Generate 500 seed examples | ~3 K | ~25 K | $0.02 | ~30 s |
+| Generate 50 benchmark pairs | ~5 K | ~8 K | $0.005 | ~15 s |
+| Active labeling per query | ~1 K | ~200 | $0.0003 | <1 s |
+
+**Full one-shot setup: under $0.10. Lifetime active labeling at typical
+use: ~$1/month.**
+
+### Security guarantees (enforced in code)
+
+1. Key never leaves `.env` / `.claude/.env`. Tools read it via `python-dotenv`; never written by any tool, never logged, never cached.
+2. No tool prints the key to stdout / stderr / log files.
+3. Response cache files contain only `(prompt, response)`, never the API key.
+4. `--dry-run` shows the exact prompt that would be sent before any call.
+5. `--redact` replaces table/column names with `T1`, `C1` for the LLM; mapping happens locally.
+6. `--max-cost` refuses to proceed if pre-call estimate exceeds budget.
+7. PID lockfile prevents concurrent runs corrupting state.
+8. Schema-content sample values bounded: 5 values × 30 chars max, configurable via `--sample-size` / `--max-value-len`.
+9. `tools/requirements.txt` is **separate** from main `requirements.txt`. Production Docker image installs only main; `openai` package never lands in deployable artifact.
+
+### Approval workflow (annotation merge)
+
+1. Run `tools/annotate_schema.py --tables ...`
+2. Tool writes `schema/tmt_schema.proposed.yml`
+3. User reviews:
+   ```bash
+   diff -u schema/tmt_schema.yml schema/tmt_schema.proposed.yml
+   # or
+   python tools/apply_annotations.py --review
+   ```
+4. On accept: `python tools/apply_annotations.py --apply`
+   - Backs up live schema to `schema/tmt_schema.yml.bak.<timestamp>`
+   - Merges proposed into live (keeps existing synonyms unless `--replace`)
+   - Invalidates schema cache so next `/api/ask` picks up new annotations
+5. On reject: delete the `.proposed.yml`, optionally tweak prompts and rerun.
+
+### What ships in production vs dev
+
+| Component | In `requirements.txt` (production)? | In `tools/requirements.txt` (dev)? |
+|---|---|---|
+| `fastapi`, `uvicorn`, `sqlglot`, `psycopg2`, `nltk`, `rapidfuzz`, `scikit-learn`, `joblib`, `dateparser` | ✅ | (already there via main) |
+| `openai` | ❌ never | ✅ |
+| `ruamel.yaml` | ❌ | ✅ |
+| `tiktoken` | ❌ | ✅ |
+| `pydantic` | ✅ (already) | (already there) |
+
+The deployable Docker image stays at ~300 MB. `tools/requirements.txt` is
+installed only on the developer's machine / CI runner.
