@@ -720,3 +720,220 @@ weight it.
   worth retraining now?" without leaving the UI.
 - **Screen 5** is the audit log; gains the `picked` column so we can see
   which alternates were chosen historically.
+
+---
+
+## Will this work? — calibrated probability assessment
+
+For a fixed schema with curated synonyms (which the schema DSL provides),
+the plan should hit the same accuracy ceiling LLMs do on common
+operational queries — deterministic output, ~300 MB image, zero external
+API calls.
+
+**Calibrated bet (without LLM build oracle)**:
+
+| Outcome | Probability |
+|---|---|
+| Substantially better than today (graceful failure instead of empty SQL) | ~85 % |
+| 75 %+ accuracy on common queries within 2 weeks of dogfooding | ~60 % |
+| Matches LLM accuracy on the full range of queries | ~15 % |
+| Complete failure / has to be ripped out | ~5 % |
+
+**What it WON'T do** (no symbolic system can, no matter how layered):
+
+| Query type | Example |
+|---|---|
+| Multi-hop reasoning | "customers who bought X but not Y in Q1" |
+| Implicit aggregation logic | "best month for revenue" (ARGMAX-style) |
+| Domain-specific math | "churn rate", "MoM growth" |
+| Novel phrasings outside the trained classifier | "wildly different from typical" |
+| Free-text content search | "clients with notes mentioning X" |
+
+The realistic accuracy target is **75–85 % on common operational queries**
+*if* the schema gets annotated with synonyms.
+
+---
+
+## Improvement analysis — where wins actually come from
+
+Stepping outside the four-stage plan: **what's the highest-leverage
+improvement we can make?** Best estimate of where failures originate on
+real-world schemas like `tmt_schema.yml` (93+ tables):
+
+```
+Schema annotation gaps        ████████████████████████████  ~40 %
+Intent classifier weakness    ██████████████                ~20 %
+Missing query types (GROUP/   ████████████                  ~17 %
+  HAVING/window/CTE/UNION)
+Value resolution              ████████                      ~12 %
+Repair-loop absence           ██████                         ~8 %
+Latency / UX                  ██                             ~3 %
+```
+
+**The four-stage plan addresses ~23 % (repair, value resolution, UX).
+The remaining ~77 % is pre-algorithmic**: better schema data, broader
+intent coverage, and more diverse training data.
+
+### Five biggest improvements, ranked by ROI
+
+| # | Improvement | Effort | Expected accuracy delta | Source |
+|---|---|---|---|---|
+| 1 | **Schema annotation tooling** (auto-suggest synonyms, descriptions, sample-distinct values) | 4 h | +15–25 % | this analysis |
+| 2 | **Sentence-embedding intent classifier** (replace TF-IDF char n-grams; use fastembed ONNX MiniLM) | 3 h | +5–8 % | this analysis (informed by Paper C) |
+| 3 | **GROUP BY / HAVING / time-bucket intents** (`X by Y`, `per client`, `for each month`) | 3 h | +10–15 % | this analysis |
+| 4 | **Time-range expression parser** (`last week`, `this month`, `Q1`, `between A and B`, `YTD`) | 2 h | +5–10 % | this analysis |
+| 5 | **Better failure diagnosis** (pinpoint sketch hole that broke; suggest actionable fix) | 1 h | UX / trust, not accuracy | Paper B + this analysis |
+
+### Three architectural ideas worth considering (bigger swings)
+
+**A. Compiled query templates for the most common patterns**
+
+Skip the sketch+repair entirely for super-common shapes. Pattern-match
+the question against a regex bank → if hit, fill slots and emit SQL
+directly. Hits in <1 ms. Most production NL2SQL systems work this way.
+The sketch+repair handles the long tail.
+
+**B. Schema introspection 2.0 — distinct-value sampling**
+
+When introspecting a new DB, also sample 50 distinct values per text
+column. Store in DSL as `sample_values:`. Two payoffs:
+- Implicit synonym discovery — `marital_status` with samples
+  `['single', 'married']` makes "single men" findable
+- Type refinement — distinguishes free-text name columns from enum
+  status columns from ID columns
+
+**C. Active-learning prioritization**
+
+Rank historical queries for retraining:
+- Queries where user picked from top-K (high signal: ambiguity that got resolved)
+- Queries that failed and were rephrased successfully
+- Queries that went from low-confidence → high-confidence over time
+- Decay weights for old queries (schema may have evolved)
+
+### What we'd skip or defer
+
+| Item | Why skip |
+|---|---|
+| Hand-curated hints (Paper A.T1b) | History-driven loop captures the same info organically |
+| Graph-based schema encoding (RAT-SQL) | Heavy ML, marginal gain on annotated schemas |
+| Multi-hop reasoning ("X but not Y") | Requires LLM-style reasoning; ~5 % of queries; document as known limit |
+| Free-text search (FTS over descriptions) | Add only if description-heavy columns exist |
+| Multi-dialect support | YAGNI until non-Postgres target appears |
+| RL training, fine-tuning | LLM-only, not for us |
+
+### The two-question gate
+
+Before any code:
+
+1. **What does "good enough" mean?** "Reduce SQL-writing time for the team's recurring queries" → top-5 list above gets you there. "Answer arbitrary questions a non-technical user types" → always hits the LLM ceiling.
+2. **How many minutes/week on schema annotation?** Zero → ceiling ~60 %. 30 min/week → 80–85 % within a month. **Or: use an LLM at build time** (next section) → annotation cost drops to ~$0.30 once.
+
+---
+
+## LLM as build-time oracle (the smart pivot)
+
+**The constraint was "no LLM in the *hot path*"** — using an LLM as an
+**offline build-and-train tool** is a completely different category. It
+addresses the biggest bottleneck (schema annotation) without violating
+the runtime constraint.
+
+This is the SQL-PaLM data-engineering playbook, but unlike SQL-PaLM, **we
+keep inference symbolic**. The LLM never enters production.
+
+### Six offline pipelines
+
+| # | Pipeline | What it does | Cost | Frequency |
+|---|---|---|---|---|
+| 1 | `tools/annotate_schema.py` | Auto-generate `description:` + `synonyms:` per column from name + sample DB values + FK context | $0.10–$0.30 | On schema change |
+| 2 | `tools/generate_seed.py` | Replace 60 hand-written training examples with 500–1000 LLM-generated diverse phrasings, balanced across intents | $0.05–$0.10 | On schema change |
+| 3 | `tools/generate_benchmark.py` | Produce 50–100 (question, expected_sql) pairs as ground-truth held-out test set | $0.20 | On schema change |
+| 4 | `tools/active_label.py` | When classifier confidence < 0.3, ask LLM once, cache label, retrain on combined corpus | ~$0.001/query | Continuous (rare) |
+| 5 | `tools/diagnose_failure.py` | For queries we miss, ask LLM "what's wrong"; use the diagnosis to design new repair tactics symbolically | $0.005/failure | Weekly batch |
+| 6 | `tools/generate_tests.py` | Per new feature, generate edge-case test inputs covering the new intent or repair tactic | $0.10/feature | Per feature |
+
+**Lifetime total over 6 months of dev + production: under $20.**
+
+### Architectural separation
+
+The LLM never enters production. Deployable image stays unchanged — no
+`openai` package, no API key, no network calls.
+
+```
+docker-nl2sql/
+├── app/                     ← runtime, LLM-free, ~300 MB image
+│   ├── builder.py
+│   ├── generator.py
+│   └── ...
+└── tools/                   ← dev/CI only, may call OpenAI
+    ├── annotate_schema.py
+    ├── generate_seed.py
+    ├── generate_benchmark.py
+    ├── active_label.py
+    ├── diagnose_failure.py
+    └── .cache/              ← gitignored, holds LLM responses
+```
+
+`tools/` requires `OPENAI_API_KEY` set in dev shell. Production never sees it.
+
+### Guardrails
+
+| Risk | Guardrail |
+|---|---|
+| LLM hallucinates wrong synonyms / descriptions | Annotations land as PR-style diff; accept/reject per column. Never auto-applied. |
+| Schema metadata leaks to OpenAI | Document explicitly. `--exclude-tables` flag for sensitive schemas. Optional redaction mode (replace real names with `tableA`, map back after annotation). |
+| Determinism / reproducibility | Pin model (`gpt-4o-2024-08-06`), `temperature=0`, cache all responses to disk under `tools/.cache/`. |
+| Annotation drift between runs | Annotations committed to git. Re-runs only update *new* tables/columns by default; existing requires explicit `--overwrite`. |
+| Test set contaminates training | Benchmark held out; never used in seed corpus. |
+| Cost runaway | Hard daily budget cap in OpenAI dashboard ($1 is more than enough). |
+
+### Updated plan with LLM-as-build-oracle
+
+Order changes meaningfully — annotation moves first because it's now cheap:
+
+| Order | Item | LLM-powered? | Effort | Impact |
+|---|---|---|---|---|
+| **0** | Build `tools/annotate_schema.py` | ✅ | 2 h | Foundation for everything |
+| **1** | Build `tools/generate_seed.py` + `generate_benchmark.py` | ✅ | 2 h | Measurement + training data |
+| **2** | Run pipelines, accept annotations, establish baseline | ✅ | 1 h | "today we get N/100" |
+| **3** | Sketch + repair loop (Paper B) | symbolic runtime | 8 h | +10–15 % accuracy |
+| **4** | GROUP BY / HAVING / time-range coverage | symbolic | 5 h | +15–20 % accuracy |
+| **5** | Sentence-embedding intent classifier | symbolic runtime; LLM may inform seeds | 3 h | +5–8 % |
+| **6** | DB content matching (Paper A.T1a) | symbolic | 3 h | +5–8 % |
+| **7** | Active labeling pipeline | ✅ batch | 2 h | self-improving loop |
+| **8** | Execution-guided + multi-component scoring (Stages 2 + Bonus) | symbolic | 2.5 h | +3–5 % |
+| **9** | MISP top-K UI | symbolic | 1.5 h | UX + training signal |
+| **10** | Failure-diagnosis pipeline (weekly) | ✅ batch | 1 h | continuous improvement |
+
+**Total effort**: ~31 hours. **Runtime LLM cost: $0.** **Build LLM cost: ~$20 lifetime.**
+
+### Probability of success — updated
+
+| Outcome | Without build LLM | **With build LLM** |
+|---|---|---|
+| Substantially better than today | 85 % | **95 %** |
+| 75 %+ accuracy within 2 weeks | 60 % | **85 %** |
+| 85 %+ accuracy within a month | 30 % | **65 %** |
+| Matches LLM on full range | 15 % | **25 %** |
+| Complete failure | 5 % | **< 2 %** |
+
+The schema-annotation gap was the biggest bottleneck. Closing it with an
+LLM at build time is the right answer.
+
+### Concrete next step
+
+Build the smallest end-to-end LLM tool first to validate the approach:
+**`tools/annotate_schema.py`** on a 5-table slice of the real schema
+(Client, Organization, Employee, Tour, Invoice). ~1 hour. We see:
+
+- Does the LLM produce reasonable synonyms / descriptions?
+- How much does the matcher improve on a benchmark with vs without
+  annotations?
+- Is the cost what was estimated?
+
+If it works → build the rest. If it doesn't → we know the bottleneck
+before committing more time.
+
+**Prerequisites**:
+1. `OPENAI_API_KEY` in dev shell or `.env`
+2. OK to send schema metadata (table/column names) to OpenAI
+3. Trial slice of 5 tables agreed
