@@ -1,0 +1,13 @@
+# Dev/CI-only dependencies for the LLM-as-build-oracle tools.
+#
+# These are NOT installed into the production Docker image. Install them
+# only on a developer machine or CI runner that needs to run the tools/
+# scripts.
+#
+#   pip install -r tools/requirements.txt
+#
+# The runtime never imports `openai` — these tools are the only place it
+# appears.
+
+openai==1.109.1
+ruamel.yaml==0.18.6

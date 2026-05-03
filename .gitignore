@@ -9,3 +9,8 @@ history.db
 *.log
 *.joblib
 .DS_Store
+
+# Tool artefacts
+tools/.cache/
+schema/*.proposed.yml
+schema/*.yml.bak.*
