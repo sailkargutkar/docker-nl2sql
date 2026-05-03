@@ -27,6 +27,118 @@ papers added refinements (C, D) or corroborated existing ideas (E, F, G).
 
 ---
 
+## Conclusion — what we take from each paper
+
+Out of seven papers, **four contributed concrete ideas** to the implementation;
+**three were corroborative only**. Full attribution by paper:
+
+### 🟢 Paper B — SQLizer → THE FOUNDATION
+
+The single most influential paper. Provides the entire architectural backbone.
+
+| Idea | Lands in |
+|---|---|
+| Explicit query-sketch IR with typed holes | `app/sketch.py` (new) |
+| Quantitative type inhabitation — enumerate fillers, score each | `app/sketch.py` |
+| Refinement / repair loop (fault localization → repair tactic → retry) | `app/repair.py` (new) |
+| Repair tactics: add JOIN, swap aggregate ↔ column, add predicate, change table | `app/repair.py` |
+| Top-K ranked candidates instead of single SQL | `app/generator.py` |
+| Fault-aware error messages (which sketch position broke) | builder errors |
+
+→ **Stage 1**, ~500 lines. Without B, we have no architecture.
+
+### 🟢 Paper A — SQL-PaLM → VALUE PRECISION
+
+| Idea | Lands in |
+|---|---|
+| **DB content matching (T1a)** — for each NL keyword, ILIKE + LCS against actual DB cell values | `app/nlp/values_db.py` (new) |
+| Resolves `"shoes"` → `"Running shoes"`, `"california"` → `"California"`, `"acme"` → `"Acme Corp Pvt Ltd"` | Plugs into sketch's value-hole scoring |
+
+→ **Stage 3**, ~150 lines. A.T1b (hand-curated hints) was **rejected** —
+replaced by C's MISP loop which captures the same information organically.
+
+### 🟢 Paper C — Survey → CLOSES THE LEARNING LOOP
+
+| Idea | Source within survey | Lands in |
+|---|---|---|
+| **Interactive disambiguation (MISP)** — when top-1/top-2 confidence are close, ask the user to pick | MISP entry | UI button + `POST /api/teach` |
+| **Execution-guided validation** — execute top-K read-only, discard errors, re-rank | PointerSQL, SeaD entries | `app/generator.py` post-repair |
+
+→ **Stages 2 & 4**, ~140 lines. MISP is what makes the system **truly
+self-sustaining** — every user click writes labeled data to `history.db`
+for the next retrain.
+
+### 🟢 Paper D — SQL-R1 → SCORING RECIPE
+
+| Idea | Lands in |
+|---|---|
+| **Multi-component scoring** — Format + Execution + Result-plausibility + Length penalty | `app/generator.py` confidence function |
+| Ablation: removing any component drops accuracy 0.7–2.7 % (additive, non-redundant signals) | Validates the 4-component approach |
+
+→ Refines **Stage 2**, ~30 lines. Replaces a single confidence number with
+the 4-signal sum.
+
+### 🟡 Paper G — Jeong → METRIC ONLY
+
+| Idea | Lands in |
+|---|---|
+| **Syntactic Error Rate (SER)** — log parse failures + validation failures + execution errors as separate counters | `/api/health` extension |
+
+→ **Bonus**, ~15 lines. G's main idea (hybrid sketch + generation decoder)
+corroborates Paper B but isn't a separately adopted item.
+
+### ⚪ Papers E & F — corroboration only, nothing adopted
+
+| Paper | What it confirmed | New code? |
+|---|---|---|
+| **E** Sathick 2015 | Independent confirmation of MISP idea (user picks from intermediate queries) | None — strengthens C's adoption |
+| **F** Bhalla 2018 | Column attention ≈ our rapidfuzz + WordNet matcher | None — already covered |
+
+---
+
+### Final attribution at a glance
+
+```
+Stage 1: Sketch IR + repair loop + top-K            ← Paper B           ~500 lines
+Stage 2: Execution-guided validation                ← Paper C
+         + multi-component scoring                  ← Paper D            ~80 lines
+Stage 3: DB content value matching                  ← Paper A.T1a       ~150 lines
+Stage 4: Interactive top-K disambiguation UI        ← Paper C (MISP)
+                                                       confirmed by E    ~60 lines
+Bonus:   Syntactic Error Rate metric                ← Paper G            ~15 lines
+                                                                       ─────────
+                                                                  total: ~810 lines
+```
+
+### One-line summary per paper
+
+- **B** gives us the **architecture** (sketch + repair).
+- **A** gives us **value precision** (real DB values, not guesses).
+- **C** gives us the **user feedback loop** (interactive disambiguation + execution validation).
+- **D** gives us the **scoring formula** (4-signal confidence).
+- **G** gives us **observability** (SER metric).
+- **E, F** add nothing — but their independent agreement with B and C raises
+  confidence we picked the right primitives.
+
+### LLM ↔ non-LLM mapping
+
+Each adopted idea is the **non-neural essence** of its LLM-era source:
+
+| Idea pattern | LLM version | Our LLM-free version |
+|---|---|---|
+| Sketch fill | Neural slot decoder | Symbolic enumeration with rapidfuzz scoring |
+| Repair | LLM retry with feedback | Deterministic tactic application |
+| Value matching | Embedding similarity | ILIKE + longest common subsequence |
+| Confidence | Softmax / RL reward | 4-component additive score |
+| User loop | RLHF | UI click → history.db → retrain |
+| Validation | Ground-truth comparison | Heuristic plausibility (rows > 0, sane size) |
+
+The bet: for a fixed schema with curated synonyms (which the schema DSL
+already provides), this stack hits the same accuracy ceiling LLMs do —
+deterministic output, ~300 MB image, zero external API calls.
+
+---
+
 ## Paper A — SQL-PaLM (arXiv 2306.00739)
 
 **Citation**: Sun, R. et al. *SQL-PaLM: Improved Large Language Model Adaptation for Text-to-SQL (extended)*. 2023.
