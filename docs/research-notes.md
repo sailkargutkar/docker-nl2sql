@@ -482,3 +482,241 @@ this point, additional surveys are unlikely to change the plan unless
 they introduce a fundamentally novel mechanism not seen in A–G (e.g.,
 constraint solving, formal verification, type inference, retrieval-
 augmented sketch synthesis).
+
+---
+
+## UI wireframes — post-implementation
+
+ASCII sketches of every screen the user touches once the four-stage plan
+ships. The current static page (`static/index.html`) only covers the
+"Main query" and "Single confident result" screens; everything else is
+new in Stages 2 / 4 / Bonus.
+
+### Pipeline flow (what happens behind each "Run")
+
+```
+                    ┌──────────────────────────┐
+   user question →  │  preprocess + extract    │
+                    │  values + implicit hints │
+                    └────────────┬─────────────┘
+                                 │
+                    ┌────────────▼─────────────┐
+                    │  intent classifier       │
+                    │  (TF-IDF + LinearSVC)    │
+                    └────────────┬─────────────┘
+                                 │
+                    ┌────────────▼─────────────┐
+                    │  schema matcher          │  ← rapidfuzz + WordNet
+                    │  + DB content lookup     │  ← Stage 3 (Paper A)
+                    └────────────┬─────────────┘
+                                 │
+                    ┌────────────▼─────────────┐
+                    │  build SKETCH (typed     │  ← Stage 1 (Paper B)
+                    │  holes + NL hints)       │
+                    └────────────┬─────────────┘
+                                 │
+                    ┌────────────▼─────────────┐
+                    │  type inhabitation       │  ← enumerate fillers
+                    │  → top-K completions     │     score each
+                    └────────────┬─────────────┘
+                                 │
+                          confidence ≥ θ ?
+                          ┌──────┴──────┐
+                         yes            no
+                          │             │
+                          │   ┌─────────▼──────────┐
+                          │   │  REPAIR LOOP       │  ← Stage 1 (Paper B)
+                          │   │  fault localize    │
+                          │   │  → tactic          │
+                          │   │  → retry (≤5)      │
+                          │   └─────────┬──────────┘
+                          │             │
+                          └─────┬───────┘
+                                │
+                    ┌───────────▼──────────────┐
+                    │  execute top-K read-only │  ← Stage 2 (Paper C)
+                    │  + multi-component score │  ← Stage 2 (Paper D)
+                    │  format / exec / result  /
+                    │  / length                │
+                    └───────────┬──────────────┘
+                                │
+                  top-1 unique winner?
+                  ┌─────────────┴─────────────┐
+                 yes                          no (ties or low conf)
+                  │                            │
+        ┌─────────▼────────┐         ┌─────────▼─────────┐
+        │ render result +  │         │ MISP top-K UI     │  ← Stage 4 (Paper C)
+        │ feedback buttons │         │ user picks one    │     confirmed by E
+        └─────────┬────────┘         └─────────┬─────────┘
+                  │                            │
+                  └──────────────┬─────────────┘
+                                 │
+                    ┌────────────▼─────────────┐
+                    │  log to history.db       │  ← retrain corpus
+                    │  (q, sql, picked, score) │     for next /api/train
+                    └──────────────────────────┘
+```
+
+### Screen 1 — Main query (today; minor additions)
+
+```
+┌─ NL2SQL ─────────────── db: tmt-demo · 93 tables · trained · [Retrain] [⚙] ─┐
+│                                                                             │
+│ ┌─────────────────────────────────────────────────────────────────────────┐ │
+│ │ Ask in English, e.g. "How many active employees does each client have?" │ │
+│ │                                                                         │ │
+│ └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                             │
+│ [ Run ]  [ Show SQL only ]  🎙   ☑ Show generated SQL          status…      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Screen 2 — Top-K disambiguation (Stage 4, MISP)
+
+Triggered when top-1 and top-2 confidence are within ~10 %, OR when the
+user clicks "show alternatives" on the result screen.
+
+```
+┌─ I have 3 ways to read this — pick one ───────────────────────────────────┐
+│                                                                           │
+│ "Give me total users belongs to org swaraj"                               │
+│                                                                           │
+│  ┌─ ① count of users in Organization 'swaraj' ── 78% ─────── [ Use ] ──┐ │
+│  │ SELECT COUNT(*) FROM "UserOrg"                                       │ │
+│  │   JOIN "Organization" ON "UserOrg"."OrganizationId"                  │ │
+│  │                       = "Organization"."id"                          │ │
+│  │   WHERE "Organization"."name" = 'swaraj'                             │ │
+│  │ ▸ ran in 12 ms · returns 1 row                                       │ │
+│  └──────────────────────────────────────────────────────────────────────┘ │
+│                                                                           │
+│  ┌─ ② list of users in Organization 'swaraj' ── 71% ─────── [ Use ] ──┐ │
+│  │ SELECT "User"."id", "User"."name", "User"."email"                    │ │
+│  │   FROM "UserOrg"                                                     │ │
+│  │   JOIN "User"         ON "UserOrg"."UserId" = "User"."id"            │ │
+│  │   JOIN "Organization" ON …                                           │ │
+│  │   WHERE "Organization"."name" = 'swaraj' LIMIT 500                   │ │
+│  │ ▸ ran in 18 ms · returns 47 rows                                     │ │
+│  └──────────────────────────────────────────────────────────────────────┘ │
+│                                                                           │
+│  ┌─ ③ count of UserOrg rows ─────────────────── 64% ─────── [ Use ] ──┐ │
+│  │ SELECT COUNT(*) FROM "UserOrg"                                       │ │
+│  │ ▸ rejected: missing Organization filter                              │ │
+│  └──────────────────────────────────────────────────────────────────────┘ │
+│                                                                           │
+│  Picking one teaches the system. Next time it'll prefer your choice.      │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### Screen 3 — Single confident result (with feedback)
+
+Shown when the top candidate is a clear winner (margin ≥ 10 % to #2,
+executes cleanly). Adds a feedback row at the bottom that escalates to
+Screen 2 on click.
+
+```
+┌─ Result ──────────────────────────────────────────────────────────────────┐
+│ EXPLANATION                                                               │
+│ COUNT(*) on "UserOrg" joined to "Organization", filtered by name='swaraj' │
+├───────────────────────────────────────────────────────────────────────────┤
+│ SQL                                                                       │
+│ SELECT COUNT(*) AS "count"                                                │
+│ FROM "UserOrg"                                                            │
+│   INNER JOIN "Organization" ON "UserOrg"."OrganizationId"                 │
+│                              = "Organization"."id"                        │
+│ WHERE "Organization"."name" = 'swaraj'                                    │
+├───────────────────────────────────────────────────────────────────────────┤
+│ RESULTS                                                                   │
+│  count                                                                    │
+│  ─────                                                                    │
+│   478                                                                     │
+│                                                                           │
+│ 1 row · 12 ms · tables: UserOrg, Organization                             │
+│ intent: count · confidence: 89%                                           │
+│                                                                           │
+│ Was this right?  [ ✓ Yes ]  [ ✗ No, show alternatives ]                   │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### Screen 4 — Health & quality metrics (Bonus, Paper G's SER)
+
+A small dashboard view at `/health` (or under the ⚙ panel). Auto-refreshes.
+
+```
+┌─ Health & Quality ────────────────────────────────────────────────────────┐
+│                                                                           │
+│ DATABASE                                                                  │
+│   Active: tmt-demo · 93 tables · last regenerated 2 days ago              │
+│                                                                           │
+│ MODEL                                                                     │
+│   local-rule + tfidf · trained from 56 seeds + 218 history rows           │
+│   Last trained: 2026-05-03 · [ Retrain now ]                              │
+│                                                                           │
+│ QUALITY (last 7 days, 1,243 queries)                                      │
+│   ┌─────────────────────────────────────────────────┐                     │
+│   │ Successfully executed       ██████████████ 91.3%│                     │
+│   │ Returned non-empty result   █████████████  86.1%│                     │
+│   │ User accepted top-1         ████████████   79.2%│                     │
+│   │ User picked from top-K      ██             11.8%│                     │
+│   │ Failed: validation error    ▌              2.4% │                     │
+│   │ Failed: parse error         ▏              0.7% │                     │
+│   │ Failed: execution error     ▏              0.6% │                     │
+│   └─────────────────────────────────────────────────┘                     │
+│                                                                           │
+│ TOP REPAIR TACTICS APPLIED                                                │
+│   add_join          412   (33%)                                           │
+│   swap_aggregate    187   (15%)                                           │
+│   add_predicate      94    (8%)                                           │
+│   change_table       42    (3%)                                           │
+│                                                                           │
+│ AVG LATENCY                                                               │
+│   end-to-end:  68 ms     · sketch+repair: 41 ms                           │
+│   exec+score:  19 ms     · DB content lookup: 8 ms                        │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### Screen 5 — Recent queries (existing, gains new fields)
+
+Already in the UI, but now records the user's choice so retrains can
+weight it.
+
+```
+┌─ Recent queries ──────────────────────────────────────────────────────────┐
+│                                                                           │
+│ ✓ Give me total users belongs to org swaraj                               │
+│   2026-05-03 10:14 · 1 row · 12 ms · count · 89% · accepted top-1         │
+│                                                                           │
+│ ✓ list users of org swaraj                                                │
+│   2026-05-03 10:09 · 47 rows · 18 ms · list · 71% · picked alt #2         │
+│                                                                           │
+│ ✗ tell me about the thing                                                 │
+│   2026-05-03 10:01 · 0 rows · —    · list · 12% · could not build         │
+│                                                                           │
+│ ✓ top 5 clients by paymentTerm                                            │
+│   2026-05-03 09:58 · 5 rows · 9 ms  · top   · 92% · accepted top-1        │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### API surface (additions)
+
+| Method | Path | Purpose | Stage |
+|---|---|---|---|
+| `POST` | `/api/ask` | Existing — gains `candidates: list[…]` field when ambiguous | 1 |
+| `POST` | `/api/teach` | Record user's pick from top-K | 4 |
+| `POST` | `/api/feedback` | "Yes / No" thumbs on a single-result screen | 4 |
+| `GET`  | `/api/metrics` | SER + repair-tactic counters for Screen 4 | Bonus |
+| `POST` | `/api/train` | Existing — now also weights teach/feedback rows | 4 |
+
+### Why these screens, in this order
+
+- **Screen 1** stays the calm default. The user types and runs.
+- **Screen 3** is what they see *most* of the time (high confidence).
+- **Screen 2** is the *learning surface* — the one place where ambiguity is
+  surfaced honestly and where each interaction makes the system better.
+- **Screen 4** is observability — supports the operator decision "is this
+  worth retraining now?" without leaving the UI.
+- **Screen 5** is the audit log; gains the `picked` column so we can see
+  which alternates were chosen historically.
