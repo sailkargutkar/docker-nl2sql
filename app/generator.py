@@ -108,7 +108,14 @@ def generate_sql(
     max_rows: int,
     intent_model_path: str,
     dialect: str = "postgres",
+    force_intent: str | None = None,
+    force_primary_table: str | None = None,
 ) -> GenerationResult:
+    """Produce a single SQL candidate for `question`.
+
+    `force_intent` and `force_primary_table` let the alternatives orchestrator
+    explore neighbouring interpretations of the same question (top-K).
+    """
     pre = preprocess(question)
     values = extract(question, pre.quoted_literals)
     implicit_values = detect_implicit(pre, schema)
@@ -123,16 +130,20 @@ def generate_sql(
             if iv.value.lower() not in predicate_words
         ]
 
-    clf = get_classifier(intent_model_path)
-    prediction = clf.predict(question) if clf.available else None
-    if prediction is not None and prediction.confidence >= 0.3:
-        intent = prediction.label
-        intent_conf = prediction.confidence
+    if force_intent and force_intent in INTENT_LABELS:
+        intent = force_intent
+        intent_conf = 0.6  # forced — reasonable confidence, not max
     else:
-        intent = _fallback_intent(question)
-        intent_conf = 0.4  # low-confidence fallback
-    if intent not in INTENT_LABELS:
-        intent = "list"
+        clf = get_classifier(intent_model_path)
+        prediction = clf.predict(question) if clf.available else None
+        if prediction is not None and prediction.confidence >= 0.3:
+            intent = prediction.label
+            intent_conf = prediction.confidence
+        else:
+            intent = _fallback_intent(question)
+            intent_conf = 0.4  # low-confidence fallback
+        if intent not in INTENT_LABELS:
+            intent = "list"
 
     table_matches = score_tables(pre, schema)
     table_scores = [(m.table, m.score) for m in table_matches]
@@ -156,7 +167,21 @@ def generate_sql(
             table_scores.append((iv.table_hint, 1.0))
             known_tables.add(iv.table_hint)
 
-    intent = _override_intent_for_total(intent, question, column_matches)
+    # If a specific primary table was forced, hoist it to the top so the
+    # builder picks it. We boost rather than replace so the matcher's
+    # other tables remain available for joins.
+    if force_primary_table:
+        if force_primary_table not in {t for t, _ in table_scores}:
+            table_scores.append((force_primary_table, 100.0))
+        else:
+            table_scores = [
+                (t, 100.0 if t == force_primary_table else s)
+                for t, s in table_scores
+            ]
+        table_scores.sort(key=lambda ts: ts[1], reverse=True)
+
+    if not force_intent:
+        intent = _override_intent_for_total(intent, question, column_matches)
 
     try:
         result = build(
@@ -184,3 +209,101 @@ def generate_sql(
         intent=intent,
         tables_used=result.tables_used,
     )
+
+
+# ---------- Top-K candidate generation ----------
+
+
+def _top_alt_intents(question: str, model_path: str, k: int = 2) -> list[str]:
+    """Return the top-k intent labels from the classifier (best first),
+    excluding the top-1. Falls back to a small handcrafted list if the
+    classifier isn't trained.
+    """
+    clf = get_classifier(model_path)
+    if clf.available:
+        pipe = clf._ensure()  # type: ignore[union-attr]
+        if pipe is not None:
+            probs = pipe.predict_proba([question])[0]
+            ranked = sorted(
+                zip(pipe.classes_, probs), key=lambda cp: cp[1], reverse=True
+            )
+            # Skip the first (already used by the primary pass)
+            return [str(c) for c, _ in ranked[1: 1 + k]]
+
+    # Fallback — neighbouring intents to count/list.
+    primary = _fallback_intent(question)
+    fallback_neighbours = {
+        "list": ["count", "top"],
+        "count": ["list", "exists"],
+        "top": ["list", "max"],
+        "exists": ["count", "list"],
+        "sum": ["avg", "max"],
+        "avg": ["sum", "max"],
+        "min": ["max", "list"],
+        "max": ["min", "list"],
+    }
+    return fallback_neighbours.get(primary, ["list", "count"])[:k]
+
+
+def _top_alt_tables(question: str, schema: Schema, k: int = 2) -> list[str]:
+    pre = preprocess(question)
+    matches = score_tables(pre, schema)
+    # Skip the first (already used by the primary pass)
+    return [m.table for m in matches[1: 1 + k] if m.score > 0]
+
+
+def generate_alternatives(
+    question: str,
+    schema: Schema,
+    max_rows: int,
+    intent_model_path: str,
+    dialect: str = "postgres",
+    n: int = 3,
+) -> list[GenerationResult]:
+    """Generate up to `n` distinct SQL candidates for the same question.
+
+    Strategy: run the primary generator once, then probe a small number
+    of neighbouring (intent, primary_table) combinations. De-dupe by
+    final SQL string. Sort by confidence descending.
+
+    Cheap: 3-5 generator invocations per call. Each invocation is the
+    same cost as today's single pass (~10-50 ms), all symbolic.
+    """
+    seen: set[str] = set()
+    primary: GenerationResult | None = None
+    alternatives: list[GenerationResult] = []
+
+    # 1) Primary candidate — uses the classifier's top intent + top table.
+    p = generate_sql(
+        question, schema, max_rows, intent_model_path, dialect=dialect,
+    )
+    if p.sql:
+        seen.add(p.sql)
+        primary = p
+
+    # 2) Vary intent.
+    for alt_intent in _top_alt_intents(question, intent_model_path, k=2):
+        r = generate_sql(
+            question, schema, max_rows, intent_model_path,
+            dialect=dialect, force_intent=alt_intent,
+        )
+        if r.sql and r.sql not in seen:
+            seen.add(r.sql)
+            alternatives.append(r)
+
+    # 3) Vary primary table.
+    for alt_table in _top_alt_tables(question, schema, k=2):
+        r = generate_sql(
+            question, schema, max_rows, intent_model_path,
+            dialect=dialect, force_primary_table=alt_table,
+        )
+        if r.sql and r.sql not in seen:
+            seen.add(r.sql)
+            alternatives.append(r)
+
+    # Primary always stays at position 0 — it's the system's best guess.
+    # The remaining slots get the highest-confidence alternatives.
+    alternatives.sort(key=lambda c: c.confidence, reverse=True)
+    if primary is not None:
+        return [primary] + alternatives[: n - 1]
+    return alternatives[:n]

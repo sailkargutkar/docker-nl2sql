@@ -58,6 +58,11 @@
   .history .q { color: var(--text); }
   .history .t { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
   .badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; margin-right: 6px; }
+  .alt-item { padding: 10px 14px; border-top: 1px solid var(--border); }
+  .alt-item:first-of-type { border-top: 0; }
+  .alt-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .alt-conf { color: var(--muted); font-size: 12px; flex: 1; }
+  .alt-use { padding: 4px 10px; font-size: 12px; }
   .b-ok { background: #1b3a24; color: var(--ok); }
   .b-err { background: #3a1e1e; color: var(--err); }
   .b-active { background: #1e2d4a; color: var(--accent); }
@@ -174,7 +179,29 @@ function renderTable(cols, rows) {
   return `<div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
+function renderAlternatives(alts) {
+  if (!alts || !alts.length) return '';
+  const items = alts.map((a, i) => `
+    <div class="alt-item">
+      <div class="alt-header">
+        <span class="badge b-active">${escape(a.intent || '?')}</span>
+        <span class="alt-conf">${(a.confidence*100).toFixed(0)}% confidence</span>
+        <button class="ghost alt-use" data-alt-idx="${i}">Use this</button>
+      </div>
+      ${a.explanation ? `<div class="explain">${escape(a.explanation)}</div>` : ''}
+      <pre class="sql">${escape(a.sql)}</pre>
+    </div>
+  `).join('');
+  return `<div class="card"><h3>Other interpretations</h3>
+    <div class="explain" style="padding-bottom:6px;">
+      The system isn't fully sure — pick one if it matches your intent.
+    </div>${items}</div>`;
+}
+
+let _lastAlts = [];
+
 function renderResult(r) {
+  _lastAlts = r.alternatives || [];
   const parts = [];
   if (r.error) parts.push(`<div class="card"><h3>Error</h3><div class="error">${escape(r.error)}</div></div>`);
   if (r.explanation) parts.push(`<div class="card"><h3>Explanation</h3><div class="explain">${escape(r.explanation)}</div></div>`);
@@ -189,7 +216,27 @@ function renderResult(r) {
         <span>confidence: ${(r.confidence*100).toFixed(0)}%</span>
       </div></div>`);
   }
+  parts.push(renderAlternatives(r.alternatives));
   $('#out').innerHTML = parts.join('');
+  // Wire up Use buttons after render.
+  document.querySelectorAll('.alt-use').forEach((btn) => {
+    btn.onclick = () => useAlternative(parseInt(btn.dataset.altIdx, 10));
+  });
+}
+
+function useAlternative(idx) {
+  const a = _lastAlts[idx];
+  if (!a) return;
+  // Render the chosen alternative as if it were the primary result.
+  renderResult({
+    sql: a.sql,
+    explanation: a.explanation,
+    intent: a.intent,
+    confidence: a.confidence,
+    tables_used: a.tables_used || [],
+    columns: [], rows: [], row_count: 0, elapsed_ms: 0,
+    alternatives: [],  // collapsing the picker after a choice
+  });
 }
 
 async function ask(execute) {

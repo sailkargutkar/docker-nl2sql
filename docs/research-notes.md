@@ -1742,3 +1742,168 @@ dd73a1e  feat: MySQL support — dialect-aware runtime + introspection
 The system has now solved every limit the stress test surfaced. Next
 time we touch this branch, the open items are the planned strategic
 improvements (sketch + repair, MISP), not regression fixes.
+
+---
+
+## Phase 16 — Top-K alternatives (foundation for sketch+repair and MISP)
+
+This is the first increment of **Stage 1 (sketch + repair)** from the
+seven-paper synthesis. Rather than ship the full SQLizer-style refinement
+loop in one commit, we split it: this phase wires up multi-candidate
+generation; the next phase will add explicit sketch IR and repair tactics.
+
+### What ships
+
+The generator can now emit *multiple distinct SQL candidates* for the
+same question. The API exposes them via a new `alternatives` field on
+`AskResponse`. The UI renders an "Other interpretations" panel when
+confidence is split — the user can click "Use this" to pick a different
+reading.
+
+### Why this is the right increment
+
+- **User-visible benefit immediately**: when the system isn't sure, the
+  user sees the alternatives instead of getting a wrong-but-confident
+  answer. Same UX pattern as the planned MISP top-K UI.
+- **Foundation for repair**: once we have N candidates, repair becomes
+  "score them, pick the best, refine the loser via tactics" — pure
+  additive work.
+- **Feedback signal**: each user click on an alternative becomes a
+  labelled training row for the classifier (future Phase 17 work).
+- **No new heavy dependencies**: ~250 lines of orchestration on top of
+  the existing builder.
+
+### Implementation
+
+**[app/generator.py](../app/generator.py)** gains two parameters and
+one new public function:
+
+```python
+def generate_sql(
+    ...,
+    force_intent: str | None = None,
+    force_primary_table: str | None = None,
+) -> GenerationResult: ...
+
+def generate_alternatives(
+    question, schema, max_rows, intent_model_path,
+    dialect="postgres", n=3,
+) -> list[GenerationResult]:
+    """Up to n distinct SQL candidates. Primary always at index 0."""
+```
+
+The orchestrator runs the primary generator once, then probes
+neighbouring (intent, table) combinations using `force_*`. De-dupes by
+final SQL string. **Primary stays at index 0** (it's the system's
+best guess); the rest are sorted by confidence.
+
+**[app/main.py](../app/main.py)**:
+
+- New `AlternativeInterpretation` Pydantic model (sql, intent,
+  explanation, confidence, tables_used).
+- `AskResponse.alternatives: list[AlternativeInterpretation] = []`.
+- `/api/ask` calls `generate_alternatives(n=3)` instead of single
+  `generate_sql`. Surfaces alternatives **only when** top-1 is uncertain
+  (`confidence < 0.75`) **OR** the gap to top-2 is < 0.15.
+- All five `AskResponse` return paths (success, no-SQL, validation
+  failure, dry-run, exec failure) now thread the alternatives through.
+
+**[static/index.html](../static/index.html)**:
+
+- New `renderAlternatives()` function rendering a card with one
+  expandable section per alternative (intent badge + confidence + SQL
+  + Use button).
+- "Use this" wires through `useAlternative(idx)` which re-renders the
+  result panel with the chosen alternative as the primary view.
+- Minimal CSS additions to keep the dark-theme look consistent.
+
+### Where alternatives surface — UX rules
+
+| Top-1 confidence | Top-1 vs top-2 gap | Show alternatives? |
+|---|---|---|
+| ≥ 0.75 | ≥ 0.15 | **No** — primary is confident, no clutter |
+| ≥ 0.75 | < 0.15 | Yes — close call worth showing |
+| < 0.75 | any | Yes — system isn't sure, surface options |
+
+Up to **2 alternatives** are returned (3 candidates total). Limits keep
+responses small and the UI uncluttered.
+
+### Live test on jodhpur
+
+```
+Q: list products
+   primary intent=list conf=0.54  alts=2
+   alt: [exists conf=0.60] SELECT COUNT(*) > 0 AS "exists" FROM "products"
+   alt: [list conf=0.54]   SELECT "auxproduct"."productId" FROM "auxproduct" LIMIT 500
+
+Q: how many products
+   primary intent=count conf=0.60  alts=2
+   alt: [exists conf=0.60] SELECT COUNT(*) > 0 AS "exists" FROM "products"
+   alt: [count conf=0.60]  SELECT COUNT(*) AS "count" FROM "auxproduct"
+
+Q: top 5 products by pricesell
+   primary intent=top conf=0.65  alts=2
+   alt: [list conf=0.60]   SELECT "products"."pricesell" FROM "products" LIMIT 500
+   alt: [exists conf=0.60] SELECT COUNT(*) > 0 AS "exists" FROM "products"
+
+Q: how many things        (no schema match — alternatives empty as expected)
+   primary intent=count conf=0.00  alts=0
+```
+
+### Test coverage
+
+`tests/test_alternatives.py` — 8 new tests:
+
+- `TestForcedGeneration` (3) — `force_intent`, `force_primary_table`,
+  bogus-intent-falls-through.
+- `TestGenerateAlternatives` (4) — at-most-n, primary-stays-first,
+  alternatives-are-distinct, no-results-when-unmatchable.
+- `TestApiAlternatives` (1) — `AskResponse.alternatives` field
+  present and is a list.
+
+**105 / 105 tests passing** (was 97; +8 in this phase).
+
+### What's NOT in this phase (deferred)
+
+- **Explicit sketch IR**: still implicit in the builder. Adding a
+  `Sketch` dataclass that captures (intent, table, projection, filters,
+  joins) would make repair tactics cleaner. Phase 17.
+- **Repair tactics**: add_join, swap_aggregate, change_table — pending
+  the explicit sketch IR.
+- **Execution-guided ranking** (Paper C): running each candidate
+  read-only against the DB and re-ranking by row plausibility. Phase 17.
+- **Multi-component scoring** (Paper D): four-signal ranking (format,
+  exec, result, length).
+- **Teach-back loop**: when the user clicks "Use this" on an alternative,
+  POST that choice to `/api/teach` so the next retrain weights the
+  alternative as the correct answer. Phase 18 — the MISP closing-the-
+  loop work.
+
+### Cumulative ship log (post-Phase-16)
+
+```
+45c07e7  feat(phase-15): compound split + bool auto-TRUE + IS NULL
+60e9a9e  fix: Phase-13 weaknesses
+cb63a8e  feat(matcher): length-gated lower fuzzy threshold
+bbe0e03  feat: MariaDB compat in executor
+c43d343  feat: UI dialect selector + dialect-aware tests
+dd73a1e  feat: MySQL support
+[next]   feat(phase-16): top-K alternatives — generator + API + UI panel
+```
+
+### Capability matrix (post-Phase-16)
+
+| Capability | Status |
+|---|---|
+| Postgres / MySQL / MariaDB execution | ✅ |
+| Schema introspection (all three) | ✅ |
+| Deterministic annotation, no LLM | ✅ |
+| Typo tolerance, compound names | ✅ |
+| Auto-TRUE on `are/is X`, IS NULL on `without/no` | ✅ |
+| Cross-table WHERE, JOIN inference | ✅ |
+| **Top-K candidate generation** | ✅ Phase 16 |
+| **Alternative interpretations in API + UI** | ✅ Phase 16 |
+| Explicit sketch IR | ⏳ Phase 17 (planned) |
+| Repair tactics | ⏳ Phase 17 (planned) |
+| Execution-guided ranking | ⏳ Phase 17 (planned) |
+| Teach-back loop (`/api/teach`) | ⏳ Phase 18 (planned) |

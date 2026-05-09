@@ -13,7 +13,7 @@ from sqlalchemy import create_engine, text
 from . import db_registry, history, schema_dsl, schema_introspect
 from .config import settings
 from .executor import execute
-from .generator import generate_sql, reset_classifier
+from .generator import generate_alternatives, generate_sql, reset_classifier
 from .schema_dsl import get_schema, invalidate_cache
 from .training.fit import fit as fit_classifier
 from .validator import ValidationError, validate_and_rewrite
@@ -80,6 +80,19 @@ class AskRequest(BaseModel):
     execute: bool = True
 
 
+class AlternativeInterpretation(BaseModel):
+    """A single non-chosen interpretation of the user's question.
+
+    The UI surfaces these when top-1 and top-2 confidence are close —
+    so the user can click to use a different reading.
+    """
+    sql: str
+    intent: str
+    explanation: str
+    confidence: float
+    tables_used: list[str] = []
+
+
 class AskResponse(BaseModel):
     sql: str | None
     explanation: str
@@ -93,6 +106,10 @@ class AskResponse(BaseModel):
     truncated: bool = False
     model: str = "local-rule+tfidf"
     error: str | None = None
+    # Up to 2 alternative interpretations, populated only when top-1
+    # confidence is below 0.75 OR top-1 and top-2 are within 15%.
+    # The UI uses this to offer a "did you mean…" picker.
+    alternatives: list[AlternativeInterpretation] = []
 
 
 @app.get("/api/health")
@@ -146,7 +163,11 @@ def ask(req: AskRequest) -> AskResponse:
         raise HTTPException(400, "No schema loaded. Configure a database first.") from e
 
     try:
-        gen = generate_sql(
+        all_candidates = generate_alternatives(
+            req.question, schema, settings.max_rows,
+            settings.intent_model_path, dialect=active.dialect, n=3,
+        )
+        gen = all_candidates[0] if all_candidates else generate_sql(
             req.question, schema, settings.max_rows,
             settings.intent_model_path, dialect=active.dialect,
         )
@@ -159,6 +180,23 @@ def ask(req: AskRequest) -> AskResponse:
             error=str(e),
         )
         raise HTTPException(500, f"Generation failed: {e}") from e
+
+    # Surface up to 2 alternatives when the chosen one is shaky:
+    # (a) top-1 confidence below 0.75 (the system isn't sure), OR
+    # (b) gap between top-1 and top-2 is < 0.15 (close call).
+    alternatives_to_show: list[AlternativeInterpretation] = []
+    if len(all_candidates) > 1 and gen.confidence:
+        top2 = all_candidates[1]
+        gap = gen.confidence - top2.confidence
+        if gen.confidence < 0.75 or gap < 0.15:
+            for alt in all_candidates[1:3]:
+                alternatives_to_show.append(AlternativeInterpretation(
+                    sql=alt.sql,
+                    intent=alt.intent,
+                    explanation=alt.explanation,
+                    confidence=alt.confidence,
+                    tables_used=alt.tables_used,
+                ))
 
     if not gen.sql:
         history.record(
@@ -176,6 +214,7 @@ def ask(req: AskRequest) -> AskResponse:
             intent=gen.intent,
             model=gen.model,
             error="no_sql_generated",
+            alternatives=alternatives_to_show,
         )
 
     try:
@@ -198,6 +237,7 @@ def ask(req: AskRequest) -> AskResponse:
             intent=gen.intent,
             model=gen.model,
             error=f"validation_failed: {e}",
+            alternatives=alternatives_to_show,
         )
 
     if not req.execute:
@@ -208,6 +248,7 @@ def ask(req: AskRequest) -> AskResponse:
             intent=gen.intent,
             tables_used=validated.tables_used,
             model=gen.model,
+            alternatives=alternatives_to_show,
         )
 
     try:
@@ -235,6 +276,7 @@ def ask(req: AskRequest) -> AskResponse:
             tables_used=validated.tables_used,
             model=gen.model,
             error=f"execution_failed: {e}",
+            alternatives=alternatives_to_show,
         )
 
     history.record(
@@ -260,6 +302,7 @@ def ask(req: AskRequest) -> AskResponse:
         elapsed_ms=exec_result.elapsed_ms,
         truncated=exec_result.truncated,
         model=gen.model,
+        alternatives=alternatives_to_show,
     )
 
 
