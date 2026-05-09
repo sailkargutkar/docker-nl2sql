@@ -86,6 +86,32 @@ def _is_boolean(col: Column) -> bool:
     return col.type.lower() in BOOLEAN_TYPES
 
 
+_BOOL_COL_PREFIXES = ("is", "has", "had", "have", "should", "can", "will", "did")
+
+
+def _bool_col_matches_predicate(col_name: str, pred_lemma: str) -> bool:
+    """Does this boolean column name correspond to the predicate token?
+
+    Handles snake_case, camelCase, AND no-separator names (`isservice`,
+    `haslicense`) by stripping a known is_/has_-style prefix.
+    """
+    from .nlp.matcher import _split_identifier
+    from .nlp.preprocess import _lemma
+
+    if pred_lemma in _split_identifier(col_name):
+        return True
+
+    name_lc = col_name.lower()
+    for marker in _BOOL_COL_PREFIXES:
+        if name_lc.startswith(marker) and len(name_lc) > len(marker) + 1:
+            suffix = name_lc[len(marker):].lstrip("_")
+            if not suffix:
+                continue
+            if pred_lemma == _lemma(suffix):
+                return True
+    return False
+
+
 def _is_string(col: Column) -> bool:
     return col.type.lower() in STRING_TYPES
 
@@ -231,6 +257,59 @@ def _build_where(
                     ),
                 )
                 break
+
+    # Boolean predicates from "is/are/has" phrasing → bind to a boolean
+    # column whose name maps to the predicate token. Handles three shapes:
+    #   1. is_service / has_license      (snake_case)
+    #   2. isService / hasLicense        (camelCase)
+    #   3. isservice / haslicense        (no separator — common in MySQL)
+    from .nlp.preprocess import _lemma  # local to avoid cycle
+
+    for predicate_word, sign in (values.boolean_predicates or []):
+        pred_lemma = _lemma(predicate_word)
+        for m in primary_cols:
+            if f"{m.table}.{m.column}" in used:
+                continue
+            c = _find_column(schema, m.table, m.column)
+            if not c or not _is_boolean(c):
+                continue
+            if not _bool_col_matches_predicate(c.name, pred_lemma):
+                continue
+            _record(
+                m.table,
+                m.column,
+                exp.EQ(
+                    this=_column_ref(m.table, m.column),
+                    expression=_literal(bool(sign)),
+                ),
+            )
+            break
+
+    # Negative predicates ("without X", "no X") on NON-boolean columns →
+    # emit `WHERE col IS NULL`. Catches "drivers without a license",
+    # "products without a category", etc.
+    from .nlp.matcher import _split_identifier as _split_id
+    for predicate_word, sign in (values.boolean_predicates or []):
+        if sign:
+            continue
+        pred_lemma = _lemma(predicate_word)
+        for m in primary_cols:
+            if f"{m.table}.{m.column}" in used:
+                continue
+            c = _find_column(schema, m.table, m.column)
+            if not c or _is_boolean(c):  # boolean handled above
+                continue
+            if pred_lemma not in _split_id(c.name):
+                continue
+            _record(
+                m.table,
+                m.column,
+                exp.Is(
+                    this=_column_ref(m.table, m.column),
+                    expression=exp.Null(),
+                ),
+            )
+            break
 
     # Dates → date/timestamp columns on any matched table.
     for d in list(values.dates):

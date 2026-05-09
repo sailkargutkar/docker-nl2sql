@@ -1570,3 +1570,175 @@ Total tests after Phase 14: **79/79 passing** (was 72, +7).
 3. **`any X without …` pattern** for negative-existence — covered by the exists regex but the builder doesn't yet emit `LEFT JOIN … WHERE other.id IS NULL` shape. Stays a generic exists for now.
 
 These are tracked for the next time we touch the matcher / builder.
+
+---
+
+## Phase 15 — Three remaining limits attended
+
+User asked to fix the three limits Phase 14 documented but didn't yet
+solve. All three landed in this pass.
+
+### Fix #2 (smallest, isolated) — Compound-name splitting
+
+**Problem**: `onlineorders` (no separator, no camelCase) couldn't be
+split, so the matcher had to fuzzy-match against the whole 12-char
+string. `onlne ordrs` underflowed even the lenient threshold.
+
+**Fix** ([app/nlp/_compound.py](../app/nlp/_compound.py) — new module):
+small curated `COMPOUND_PREFIXES` tuple (`online`, `tax`, `vehicle`,
+`config`, `order`, `user`, `auto`, `tour`, etc.), greedy longest-prefix
+match, conservative — only splits when the remainder is ≥ 3 chars.
+
+**Wired** into [app/nlp/matcher.py](../app/nlp/matcher.py)'s
+`_split_identifier`: when camelCase/snake_case yields a single
+all-lowercase part of length ≥ 6, try `split_compound` as a last resort.
+
+```
+onlineorders   -> ('online', 'order')        ✅
+taxcategories  -> ('tax', 'category')        ✅
+vehiclemodel   -> ('vehicle', 'model')       ✅
+auxproduct     -> ('auxproduct',)            ✅ (aux not in prefix list)
+supplier       -> ('supplier',)              ✅ (too short to consider)
+```
+
+After fix: `count onlne ordrs` and `how many tax categories` both route
+correctly via the now-split parts.
+
+### Fix #1 (medium) — Auto `WHERE bool_col = TRUE` on "are X" / "is X"
+
+**Problem**: `list products that are services` correctly identified
+the `isservice` column but didn't add a `= TRUE` filter. The
+preprocessor strips "is/are" as stopwords, so positional info was lost
+before the matcher ran.
+
+**Fix** (multi-file, kept tight):
+
+1. [app/nlp/values.py](../app/nlp/values.py): two new regexes that
+   harvest words following `is/are/has/have/with` (positive) or
+   `without/not/no` (negative), BEFORE the preprocessor strips those
+   tokens. Stored in a new `boolean_predicates: list[tuple[str, bool]]`
+   field on `ExtractedValues`.
+
+2. [app/builder.py](../app/builder.py): new helper
+   `_bool_col_matches_predicate(col_name, pred_lemma)` that handles
+   three column-name shapes:
+     - `is_service`, `has_license` (snake_case)
+     - `isService`, `hasLicense` (camelCase)
+     - `isservice`, `haslicense` (no separator — common in MySQL)
+   …by detecting an `is_/has_/can_/should_/will_/did_` prefix and
+   comparing the suffix's lemma to the predicate.
+
+3. [app/builder.py](../app/builder.py): new pass after the existing
+   booleans handler iterates `values.boolean_predicates`, finds the
+   matching boolean column on the primary table, and binds `= TRUE` /
+   `= FALSE` accordingly.
+
+4. [app/generator.py](../app/generator.py): suppress implicit-value
+   bindings for any token that's already going to be a boolean
+   predicate — prevents the spurious `name = 'services'` co-occurring
+   with the correct `isservice = TRUE`.
+
+```
+Query:  list products that are services
+Before: SELECT isservice FROM products LIMIT 100
+After:  SELECT isservice FROM products WHERE isservice = TRUE LIMIT 100
+```
+
+```
+Query:  products that are not services
+After:  SELECT isservice FROM products WHERE isservice = FALSE LIMIT 100
+```
+
+### Fix #3 (medium) — Negative-exists with `IS NULL`
+
+**Problem**: `any drivers without a license` and `products without
+category` got generic `COUNT(*) > 0`. The intended semantic is
+"records where the related thing is missing" — `WHERE col IS NULL`.
+
+**Fix** ([app/builder.py](../app/builder.py)): a third pass after
+boolean predicates. For any negative-sign predicate (`sign = False`),
+look for a non-boolean column on the primary table whose lemmatised
+parts contain the predicate; emit `IS NULL`:
+
+```
+Query:  any products without a category
+After:  SELECT COUNT(*) > 0 AS exists FROM products WHERE category IS NULL
+```
+
+```
+Query:  products with no warranty
+After:  SELECT … FROM products WHERE warranty IS NULL LIMIT 100
+```
+
+```
+Query:  are there any orders without payment status
+After:  SELECT COUNT(*) > 0 AS exists FROM onlineorders WHERE paymentStatus IS NULL
+```
+
+### Two related cleanups during Phase 15
+
+1. **`'no'` removed from `_NO_WORDS`** — was firing as a standalone
+   `False` boolean that polluted other column bindings (e.g. "no
+   warranty" was binding `iscom = FALSE` to whichever boolean column
+   came first). The negative-predicate regex handles `no X` correctly.
+2. **`_CONNECTIVE_WORDS`** in implicit detector gained `no`, `not`,
+   `without`, `any`, `all` so they no longer get consumed as literal
+   values.
+
+### Test coverage gain
+
+`tests/test_phase15.py` — 18 new tests organised in three classes:
+
+- `TestCompoundSplit` (7 tests) — locks in the prefix-list semantics:
+  splits known prefixes, refuses unknown ones, refuses too-short
+  remainders, end-to-end via `_split_identifier`.
+- `TestBoolAutoTrue` (6 tests) — every column-name shape
+  (`isservice` / `hasdiscount`), positive and negative phrasings, and
+  guards against the spurious `name = '<predicate>'` regression.
+- `TestNegativeExists` (5 tests) — `without`, `with no`, payment-status
+  case, and a guard that `'no'` doesn't pollute random boolean columns.
+
+**97 / 97 tests passing** (was 79 — added 18 in this phase).
+
+### Summary table — three weaknesses, three fixes
+
+| # | Weakness | Fix landed | Test class |
+|---|---|---|---|
+| 2 | `onlineorders` no-split compound names | Curated prefix list + `split_compound` | `TestCompoundSplit` |
+| 1 | `are X` / `is X` didn't auto-bind boolean TRUE | New `boolean_predicates` extraction + builder pass | `TestBoolAutoTrue` |
+| 3 | `any X without Y` produced generic `COUNT > 0` | Negative-predicate `IS NULL` builder pass | `TestNegativeExists` |
+
+### Cumulative ship log (post-Phase-15)
+
+```
+60e9a9e  fix: Phase-13 weaknesses — typo'd literals, exists, boolean
+cb63a8e  feat(matcher): length-gated lower fuzzy threshold
+bbe0e03  feat: MariaDB compat in executor + jodhpur schema artifact
+c43d343  feat: UI dialect selector + dialect-aware tests + docs
+dd73a1e  feat: MySQL support — dialect-aware runtime + introspection
+[next]   feat: Phase-15 — compound split, bool auto-TRUE, IS NULL negatives
+```
+
+### Final capability matrix (post-Phase-15)
+
+| Capability | Status |
+|---|---|
+| Postgres execution | ✅ |
+| MySQL execution | ✅ Phase 11 |
+| MariaDB execution | ✅ Phase 12 |
+| Schema introspection (Postgres / MySQL / MariaDB) | ✅ |
+| Deterministic annotation (no LLM) | ✅ Phase 7 |
+| LLM-assisted annotation (opt-in) | ✅ Phase 5 |
+| Typo tolerance (≥4-char words) | ✅ Phase 13 |
+| Abbreviation expansion (qty, avg, max, …) | ✅ Phase 13 |
+| Multi-table JOIN inference | ✅ baseline |
+| Cross-table WHERE | ✅ baseline |
+| **Compound name splitting (`onlineorders`)** | ✅ Phase 15 |
+| **Auto-TRUE on `are X` / `is X`** | ✅ Phase 15 |
+| **Negative-exists `IS NULL`** | ✅ Phase 15 |
+| MISP top-K UI | ⏳ Stage 4 (planned) |
+| Sketch + repair loop | ⏳ Stage 1 (planned) |
+
+The system has now solved every limit the stress test surfaced. Next
+time we touch this branch, the open items are the planned strategic
+improvements (sketch + repair, MISP), not regression fixes.

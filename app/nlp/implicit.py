@@ -32,7 +32,12 @@ _TYPO_VS_LEMMA_THRESHOLD = 0.85
 
 
 _INTRO_WORDS = {"named", "called", "name", "with"}
-_CONNECTIVE_WORDS = {"for", "of", "in", "at", "to", "by", "belongs", "belong", "from"}
+_CONNECTIVE_WORDS = {
+    "for", "of", "in", "at", "to", "by", "belongs", "belong", "from",
+    # Negation markers — these never refer to a literal value; the
+    # negative-predicate logic in values.extract() handles them.
+    "no", "not", "without", "any", "all",
+}
 
 
 @dataclass

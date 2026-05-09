@@ -31,10 +31,19 @@ _CAMEL_SPLIT_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|[_\-\s]+")
 
 @lru_cache(maxsize=2048)
 def _split_identifier(name: str) -> tuple[str, ...]:
-    """camelCase / snake_case / kebab-case identifier → lemma tokens."""
+    """Split identifier → lemma tokens. Handles camelCase / snake_case /
+    kebab-case, and as a last resort splits no-separator compound names
+    against a curated prefix list (e.g. `onlineorders` → `online + orders`)."""
     if not name:
         return tuple()
     parts = [p for p in _CAMEL_SPLIT_RE.split(name) if p]
+    # If we got just one part and it's all-lowercase, try compound split
+    # against the curated prefix list (handles `onlineorders` etc.).
+    if len(parts) == 1 and parts[0].islower() and len(parts[0]) >= 6:
+        from ._compound import split_compound
+        sub = split_compound(parts[0])
+        if len(sub) > 1:
+            parts = list(sub)
     return tuple(_lemma(p.lower()) for p in parts)
 
 

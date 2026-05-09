@@ -113,6 +113,16 @@ def generate_sql(
     values = extract(question, pre.quoted_literals)
     implicit_values = detect_implicit(pre, schema)
 
+    # If a word will be used as a boolean predicate (e.g. "are services"
+    # → bind isservice=TRUE), strip it from implicit-value candidates so
+    # we don't *also* emit a bogus `name = 'services'` filter.
+    predicate_words = {p[0].lower() for p in (values.boolean_predicates or [])}
+    if predicate_words:
+        implicit_values = [
+            iv for iv in implicit_values
+            if iv.value.lower() not in predicate_words
+        ]
+
     clf = get_classifier(intent_model_path)
     prediction = clf.predict(question) if clf.available else None
     if prediction is not None and prediction.confidence >= 0.3:

@@ -11,14 +11,17 @@ contains an apostrophe.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
 
 
 _NUMBER_RE = re.compile(r"(?<![A-Za-z_])-?\d+(?:\.\d+)?(?![A-Za-z_])")
 _YES_WORDS = {"true", "yes", "active", "enabled", "on"}
-_NO_WORDS = {"false", "no", "inactive", "disabled", "off"}
+# Note: 'no' deliberately omitted — it almost always functions as a negation
+# marker ('no warranty') rather than a standalone boolean value. The
+# negative-predicate regex (_BOOL_PRED_NEGATIVE_RE) handles those cases.
+_NO_WORDS = {"false", "inactive", "disabled", "off"}
 
 
 @dataclass
@@ -30,6 +33,11 @@ class ExtractedValues:
     booleans: list[bool]
     limit: int | None = None
     top_n: int | None = None
+    # Words appearing right after "is/are/has/have/with/without". Bound to
+    # boolean columns at builder time, so phrasings like "products that
+    # are services" get `WHERE isservice = TRUE`. Sign is True for positive
+    # phrasing (is/are/has) and False for negative (without/no).
+    boolean_predicates: list[tuple[str, bool]] = field(default_factory=list)
 
     def has_any(self) -> bool:
         return bool(
@@ -53,6 +61,16 @@ def _parse_date(text: str) -> date | None:
     return dt
 
 
+_BOOL_PRED_POSITIVE_RE = re.compile(
+    r"\b(?:is|are|has|have|with)\s+(?:a\s+|an\s+|the\s+|any\s+)?([a-zA-Z]+)\b",
+    re.I,
+)
+_BOOL_PRED_NEGATIVE_RE = re.compile(
+    r"\b(?:without|not|no)\s+(?:a\s+|an\s+|the\s+|any\s+)?([a-zA-Z]+)\b",
+    re.I,
+)
+
+
 def extract(question: str, quoted_literals: list[str] | None = None) -> ExtractedValues:
     q = question
 
@@ -65,6 +83,27 @@ def extract(question: str, quoted_literals: list[str] | None = None) -> Extracte
             booleans.append(True)
         elif w in _NO_WORDS:
             booleans.append(False)
+
+    # Boolean predicates — words following "is/are/has/have/with" (positive)
+    # or "without/not/no" (negative). The builder binds these to boolean
+    # columns at WHERE-time so phrasings like "products that are services"
+    # produce `WHERE isservice = TRUE`.
+    boolean_predicates: list[tuple[str, bool]] = []
+    seen_predicates: set[str] = set()
+    for m in _BOOL_PRED_POSITIVE_RE.finditer(lowered):
+        word = m.group(1).lower()
+        if word in _YES_WORDS or word in _NO_WORDS:
+            continue  # 'is active' already captured by booleans above
+        if word in seen_predicates:
+            continue
+        seen_predicates.add(word)
+        boolean_predicates.append((word, True))
+    for m in _BOOL_PRED_NEGATIVE_RE.finditer(lowered):
+        word = m.group(1).lower()
+        if word in seen_predicates:
+            continue
+        seen_predicates.add(word)
+        boolean_predicates.append((word, False))
 
     # Limit / top-N — these are control modifiers, not filter values.
     limit = None
@@ -115,6 +154,7 @@ def extract(question: str, quoted_literals: list[str] | None = None) -> Extracte
         booleans=booleans,
         limit=limit,
         top_n=top_n,
+        boolean_predicates=boolean_predicates,
     )
 
 
