@@ -122,6 +122,12 @@
       <div class="divider"></div>
       <h3 style="margin: 0 0 10px; font-size: 13px; color: var(--muted);">Add a new database</h3>
       <div class="row"><label for="f-name">Display name</label><input id="f-name" placeholder="e.g. prod-analytics" /></div>
+      <div class="row"><label for="f-dialect">Engine</label>
+        <select id="f-dialect" style="padding: 8px 10px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; font: inherit;">
+          <option value="postgres">PostgreSQL</option>
+          <option value="mysql">MySQL</option>
+        </select>
+      </div>
       <div class="row"><label for="f-host">Host</label><input id="f-host" placeholder="host.docker.internal (for DBs on your laptop or via SSH tunnel)" /></div>
       <div class="row"><label for="f-port">Port</label><input id="f-port" type="number" value="5432" /></div>
       <div class="row"><label for="f-dbname">Database</label><input id="f-dbname" placeholder="postgres" /></div>
@@ -318,7 +324,7 @@ async function loadDbList() {
   $('#dbList').innerHTML = items.map((it) => `
     <div class="db-row">
       <div style="flex:1;">
-        <div class="name">${escape(it.name)} ${it.is_active ? '<span class="badge b-active">active</span>' : ''}</div>
+        <div class="name">${escape(it.name)} ${it.is_active ? '<span class="badge b-active">active</span>' : ''} <span class="badge" style="background:#222a35; color:var(--muted);">${escape(it.dialect || 'postgres')}</span></div>
         <div class="info">${escape(it.username)}@${escape(it.host)}:${it.port}/${escape(it.dbname)} · ${it.table_count} tables</div>
       </div>
       ${it.is_active ? '' : `<button class="ghost" data-act="activate" data-name="${escape(it.name)}">Activate</button>`}
@@ -358,6 +364,16 @@ $('#openSettings').onclick = async () => {
 $('#closeSettings').onclick = () => $('#settingsBackdrop').classList.remove('open');
 $('#settingsBackdrop').onclick = (e) => { if (e.target === $('#settingsBackdrop')) $('#settingsBackdrop').classList.remove('open'); };
 
+// Auto-flip the default port when the engine changes (postgres 5432, mysql 3306).
+$('#f-dialect').addEventListener('change', () => {
+  const dialect = $('#f-dialect').value;
+  const portEl = $('#f-port');
+  // Only override when the user hasn't deviated from a known default.
+  if (portEl.value === '5432' || portEl.value === '3306' || !portEl.value) {
+    portEl.value = dialect === 'mysql' ? 3306 : 5432;
+  }
+});
+
 $('#addDb').onclick = async () => {
   const payload = {
     name: $('#f-name').value.trim(),
@@ -367,6 +383,7 @@ $('#addDb').onclick = async () => {
     username: $('#f-user').value.trim(),
     password: $('#f-pass').value,
     activate: $('#f-activate').checked,
+    dialect: $('#f-dialect').value,
   };
   if (!payload.name || !payload.host || !payload.dbname || !payload.username) {
     $('#addStatus').textContent = 'fill all required fields'; return;
@@ -379,7 +396,7 @@ $('#addDb').onclick = async () => {
       body: JSON.stringify(payload),
     });
     ['f-name','f-host','f-port','f-dbname','f-user','f-pass'].forEach((id) => {
-      if (id === 'f-port') $('#'+id).value = 5432;
+      if (id === 'f-port') $('#'+id).value = $('#f-dialect').value === 'mysql' ? 3306 : 5432;
       else $('#'+id).value = '';
     });
     $('#addStatus').textContent = 'added ✓';

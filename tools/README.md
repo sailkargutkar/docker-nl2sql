@@ -32,7 +32,65 @@ training data, and label uncertain history rows.
 
 ## Available tools
 
-### `annotate_schema.py` — enrich the DSL
+### `auto_annotate.py` — deterministic enrichment (RECOMMENDED, no LLM, $0)
+
+Generates descriptions + synonyms using camelCase splitting, the built-in
+business-acronym table (`tools/_acronyms.py`), per-word synonym dictionary,
+NLTK WordNet (filtered for proper nouns), and composite generation.
+
+```bash
+# Trial: 5 tables, no DB sampling
+python tools/auto_annotate.py --tables Client,Organization,Driver,Tour,Invoice --no-samples
+
+# Full schema (free, instant)
+python tools/auto_annotate.py --tables all
+
+# See exactly which rule generated each synonym
+python tools/auto_annotate.py --tables Client --verbose
+
+# For a different schema (e.g. introspected from MySQL)
+python tools/auto_annotate.py --schema schema/bombayhouse.yml --tables all
+```
+
+Same output convention as the LLM version (`schema/<name>.proposed.yml`),
+so `apply_annotations.py` works identically.
+
+### `introspect_mysql.py` — pull a MySQL schema into our YAML format
+
+Read-only. Reads `information_schema` in a MySQL DB and writes the
+schema as YAML in the same shape Postgres-introspected files use. From
+there, `auto_annotate.py` works the same way regardless of source DB.
+
+Set credentials in `.env` or `.claude/.env`:
+
+```bash
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_USER=readonly_user
+MYSQL_PASSWORD=...
+MYSQL_DATABASE=bombayhouse
+```
+
+Install dev driver and run:
+
+```bash
+.venv/bin/pip install -r tools/requirements-mysql.txt
+python tools/introspect_mysql.py --dry-run    # connect-test + summary
+python tools/introspect_mysql.py              # writes schema/<dbname>.yml
+```
+
+After that, the standard flow:
+
+```bash
+python tools/auto_annotate.py --schema schema/<dbname>.yml --tables all
+python tools/apply_annotations.py --schema schema/<dbname>.yml --apply
+```
+
+The runtime now supports MySQL too (separately) — register the same DB
+via `POST /api/databases` with `"dialect": "mysql"` (or pick MySQL from
+the engine dropdown in the UI's ⚙ panel).
+
+### `annotate_schema.py` — LLM enrichment (optional)
 
 Reads the schema YAML, asks the LLM for a one-line description and up to
 five synonyms per column, writes a `<schema>.proposed.yml` for review.
