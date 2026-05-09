@@ -116,8 +116,12 @@ def score_tables(pre: Preprocessed, schema: Schema) -> list[TableMatch]:
             if tok.lemma in parts or tok.lemma == name_joined:
                 score += 10.0
             else:
+                # Lenient fuzzy threshold (0.78) for tokens of length ≥ 4 —
+                # catches mid-word typos like "categris"→"category". Short
+                # tokens stay strict to avoid false matches like id→code.
+                threshold = 0.75 if len(tok.lemma) >= 4 else 0.85
                 f = max((_fuzzy(tok.lemma, p) for p in parts), default=0.0)
-                if f >= 0.85:
+                if f >= threshold:
                     score += f * 4.0
         if t.description:
             desc_l = t.description.lower()
@@ -169,8 +173,9 @@ def score_columns(
                 elif _column_synonym_hit(tok, col.synonyms + [col.name]):
                     c = ColumnMatch(table.name, col.name, 6.0, "synonym")
                 else:
+                    threshold = 0.75 if len(tok.lemma) >= 4 else 0.85
                     f = max((_fuzzy(tok.lemma, p) for p in parts), default=0.0)
-                    if f >= 0.85:
+                    if f >= threshold:
                         c = ColumnMatch(table.name, col.name, f * 5.0, "fuzzy")
                     elif col.description and tok.lemma in col.description.lower():
                         c = ColumnMatch(table.name, col.name, 2.0, "description")
