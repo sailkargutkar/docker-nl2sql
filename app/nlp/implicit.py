@@ -18,9 +18,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from rapidfuzz import fuzz
+
 from ..schema_dsl import Schema
 from .matcher import _split_identifier
 from .preprocess import Preprocessed, _lemma
+
+
+# Above this similarity, a candidate "value" token is more likely a typo
+# of a known schema lemma than an actual literal. Used to suppress
+# bogus WHERE name='suplier' bindings when the user typo'd a column.
+_TYPO_VS_LEMMA_THRESHOLD = 0.85
 
 
 _INTRO_WORDS = {"named", "called", "name", "with"}
@@ -110,19 +118,35 @@ def _known_lemmas(schema: Schema) -> tuple[set[str], dict[str, str]]:
 
 def detect(pre: Preprocessed, schema: Schema) -> list[ImplicitValue]:
     all_lemmas, table_by_lemma = _known_lemmas(schema)
+    # Pre-compute a list of "long" schema lemmas (≥4 chars) for cheap fuzzy
+    # rejection. Short lemmas (id, vat, pan) are skipped here — they have
+    # too high a false-positive rate at any reasonable threshold.
+    long_lemmas = [s for s in all_lemmas if len(s) >= 4]
 
     tokens = [t for t in pre.tokens if not t.is_quoted]
     out: list[ImplicitValue] = []
 
+    def _looks_like_typo_of_schema(token_lemma: str) -> bool:
+        """Was this token probably meant to be a column / table name the
+        user mistyped? If so, it's not a literal value to bind."""
+        if len(token_lemma) < 4:
+            return False
+        for lemma in long_lemmas:
+            if fuzz.token_set_ratio(token_lemma, lemma) / 100.0 >= _TYPO_VS_LEMMA_THRESHOLD:
+                return True
+        return False
+
     def _is_value_candidate(token_index: int) -> bool:
         """A token is a value candidate if it doesn't match any schema entity
-        and isn't a structural word."""
+        (exactly OR via a likely typo) and isn't a structural word."""
         t = tokens[token_index]
         if t.lemma in all_lemmas:
             return False
         if t.raw.isdigit():
             return False
         if t.lemma in _INTRO_WORDS or t.lemma in _CONNECTIVE_WORDS:
+            return False
+        if _looks_like_typo_of_schema(t.lemma):
             return False
         return True
 

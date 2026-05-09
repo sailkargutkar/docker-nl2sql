@@ -50,7 +50,12 @@ _FALLBACK_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(lowest|earliest|min(imum)?|smallest|first)\b", re.I), "min"),
     (re.compile(r"\b(highest|latest|max(imum)?|largest|most recent)\b", re.I), "max"),
     (re.compile(r"\btop\s+\d+|\btop\b.*\bby\b", re.I), "top"),
-    (re.compile(r"\b(is there|does (any|\w+) (exist|have)|any\s+\w+\s+without)\b", re.I), "exists"),
+    (re.compile(
+        r"\b(is\s+there|are\s+there|do\s+we\s+have|"
+        r"does\s+(any|\w+)\s+(exist|have)|"
+        r"any\s+\w+\s+without)\b",
+        re.I,
+    ), "exists"),
 ]
 
 

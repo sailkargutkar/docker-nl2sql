@@ -89,4 +89,12 @@ SEED: list[tuple[str, str]] = [
     ("are there any pending invoices", "exists"),
     ("do we have tours scheduled for tomorrow", "exists"),
     ("any drivers without a license", "exists"),
+    ("are there any pending orders", "exists"),
+    ("are there any active clients", "exists"),
+    ("are there products without a category", "exists"),
+    ("is there an organization called swaraj", "exists"),
+    ("do we have any employees from mumbai", "exists"),
+    ("any orders today", "exists"),
+    ("any clients with overdue invoices", "exists"),
+    ("does the database have a vehicles table", "exists"),
 ]

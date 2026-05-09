@@ -1476,3 +1476,97 @@ bbe0e03  feat: MariaDB compat in executor + jodhpur schema artifact
 | Cross-table WHERE | ✅ from initial 1bf17db |
 | MISP top-K UI | ⏳ Stage 4 (planned) |
 | Sketch + repair loop | ⏳ Stage 1 (planned) |
+
+---
+
+## Phase 14 — Attended weaknesses from Phase 13
+
+User asked to fix the three weaknesses surfaced by the stress test.
+Each was tackled, with regression tests committed to lock the fixes
+in.
+
+### Fix #1 — Implicit values reject typos that fuzzy-match a column
+
+**Bug**: `list products by suplier` → `WHERE name = 'suplier'`. The
+`suplier` token was a typo of the `supplier` column, but the implicit-
+value detector saw it as an unknown literal following a table word.
+
+**Fix** ([app/nlp/implicit.py](../app/nlp/implicit.py)): added
+`_looks_like_typo_of_schema()` to `_is_value_candidate`. Any candidate
+value-token of length ≥ 4 is rejected when its rapidfuzz token-set
+ratio against any long (≥ 4 chars) schema lemma reaches 0.85. Short
+tokens stay un-checked to avoid false positives on `id`, `vat`, `pan`.
+
+**Result**:
+```
+Before: SELECT supplier FROM products WHERE name = 'suplier' LIMIT 100
+After:  SELECT supplier FROM products LIMIT 100
+```
+
+The matcher still fuzzy-matches `suplier` → `supplier` column, so the
+SUPPLIER projection still appears — just without the spurious WHERE.
+
+### Fix #2 (partial) — Boolean column no longer gets a bogus name filter
+
+**Bug**: `list products that are services` → `WHERE name = 'services'`,
+even though there's an `isservice` boolean column on the table.
+
+**Fix**: Same as #1. `service` is a part of `isservice`, so the
+implicit detector now recognises it as schema-known and refuses to
+bind it as a literal. The matcher still surfaces `isservice` in the
+projection.
+
+**Remaining work** (documented as known limit, not fixed):
+auto-emitting `WHERE isservice = TRUE` when the user phrases it as
+"are X" / "is X". Requires positional analysis the current pipeline
+strips during stopword removal. Tracked for a future pass.
+
+### Fix #3 — `are there any X` now classifies as `exists`
+
+**Bug**: `are there any pending orders` got `intent=list`. The regex
+fallback for the exists pattern only matched `is there`; the seed
+corpus had `are there` examples but the trained classifier wasn't
+loaded in the test path.
+
+**Fix** (two parts):
+- [app/generator.py](../app/generator.py) regex now matches `is there`,
+  `are there`, `do we have`, `does X exist|have`, plus `any X without`
+- [app/training/seed.py](../app/training/seed.py) gains 8 more `exists`
+  examples to harden the classifier at retrain
+
+**Result**:
+```
+Before: SELECT … FROM onlineorders LIMIT 100   (intent=list)
+After:  SELECT COUNT(*) > 0 AS `exists` FROM onlineorders   (intent=exists)
+```
+
+### Regression tests committed
+
+`tests/test_phase13_fixes.py` — 7 tests locking in the three fixes:
+- `test_typo_of_column_name_does_not_become_value` — Fix #1 e2e
+- `test_implicit_skips_typo_of_known_lemma` — Fix #1 unit
+- `test_implicit_still_emits_real_proper_nouns` — Fix #1 doesn't over-reject
+- `test_boolean_column_no_spurious_name_filter` — Fix #2 partial
+- `test_are_there_any_routes_to_exists` — Fix #3 e2e
+- `test_do_we_have_routes_to_exists` — Fix #3 alternate phrasing
+- `test_is_there_still_routes_to_exists` — original phrasing didn't break
+
+Total tests after Phase 14: **79/79 passing** (was 72, +7).
+
+### Stress-test result, post-Phase-14
+
+| Category | Before P14 | After P14 |
+|---|---|---|
+| Spurious WHERE on typo'd literal | ⚠️ partial | ✅ no longer happens |
+| Boolean column false `name=X` filter | ⚠️ bogus filter | ✅ no spurious filter (auto-TRUE still pending) |
+| `are there any …` exists detection | ❌ list intent | ✅ exists intent |
+
+### What still doesn't work (honest)
+
+1. **Auto `WHERE bool_col = TRUE`** when user phrases it as "are X" / "is X" — needs positional info the preprocessor currently strips. Workaround: user types "active products" (the boolean value extractor recognises "active" as TRUE).
+
+2. **`onlineorders` no-separator compound names** — the matcher can't fuzzy-match `onlne` ↔ `online` because the table name has no boundary marker, so we compare `onlne` against the whole `onlineorders` string and underflow even the new 0.75 threshold. Workaround: rename the table to `online_orders` or `OnlineOrders` (camel/snake) to enable splitting.
+
+3. **`any X without …` pattern** for negative-existence — covered by the exists regex but the builder doesn't yet emit `LEFT JOIN … WHERE other.id IS NULL` shape. Stays a generic exists for now.
+
+These are tracked for the next time we touch the matcher / builder.
