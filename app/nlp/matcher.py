@@ -52,20 +52,33 @@ class TableMatch:
     score: float
 
 
+_CONTROL_VERBS = frozenset({
+    # SQL-shaped action / query verbs — expanding these via WordNet leads
+    # to false synonym matches (e.g. "show" → "picture" → `profilePic`).
+    "show", "list", "find", "get", "give", "fetch", "display", "return",
+    "count", "total", "sum", "average", "max", "min", "top", "first", "last",
+    "all", "any", "every", "each", "no", "not", "with", "without", "having",
+    "search", "select", "tell", "name", "say", "want", "need",
+})
+
+
 @lru_cache(maxsize=64)
 def _wordnet_synonyms(word: str) -> frozenset[str]:
+    if word.lower() in _CONTROL_VERBS:
+        return frozenset()
     try:
         from nltk.corpus import wordnet
     except LookupError:
         return frozenset()
 
     out: set[str] = set()
-    for syn in wordnet.synsets(word):
+    # Limit to top 2 senses + skip proper nouns to keep noise down.
+    for syn in wordnet.synsets(word)[:2]:
         for lemma in syn.lemmas():
-            out.add(lemma.name().replace("_", " ").lower())
-        for hyper in syn.hypernyms():
-            for lemma in hyper.lemmas():
-                out.add(lemma.name().replace("_", " ").lower())
+            raw = lemma.name()
+            if any(c.isupper() for c in raw):
+                continue
+            out.add(raw.replace("_", " ").lower())
     return frozenset(out)
 
 
@@ -126,13 +139,30 @@ def score_columns(
     table_filter = {t.lower() for t in tables} if tables else None
     out: list[ColumnMatch] = []
 
+    # Pre-compute multi-word phrases from consecutive tokens so multi-word
+    # synonyms ("tax id", "gst number") can match before single-word fallbacks.
+    bigrams = [
+        f"{tokens[i].lemma} {tokens[i + 1].lemma}"
+        for i in range(len(tokens) - 1)
+    ]
+
     for table in schema.tables:
         if table_filter is not None and table.name.lower() not in table_filter:
             continue
         for col in table.columns:
             parts = _split_identifier(col.name)
             joined = "".join(parts)
+            declared_syns_lc = {s.lower() for s in (col.synonyms or [])}
             best: ColumnMatch | None = None
+
+            # Multi-word synonym match (highest signal — phrase-level).
+            for bg in bigrams:
+                if bg in declared_syns_lc:
+                    cand = ColumnMatch(table.name, col.name, 12.0, "synonym")
+                    if best is None or cand.score > best.score:
+                        best = cand
+                    break
+
             for tok in tokens:
                 if tok.lemma in parts or tok.lemma == joined:
                     c = ColumnMatch(table.name, col.name, 10.0, "exact")
