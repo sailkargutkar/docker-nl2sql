@@ -1085,3 +1085,228 @@ use: ~$1/month.**
 
 The deployable Docker image stays at ~300 MB. `tools/requirements.txt` is
 installed only on the developer's machine / CI runner.
+
+---
+
+## Session journey — problems, missteps, and what we ended up shipping
+
+This section is a chronological log of *what actually happened* during
+the build session, including the wrong turns. It's preserved as honest
+record so future revisits don't re-make the same mistakes.
+
+### Phase 1 — Original brief
+
+User wanted to take an existing nl2sql codebase (LLM-based) and make it
+**self-sustaining without any LLM** at runtime. Goals:
+
+- Lightweight Docker image (~300 MB)
+- Deterministic SQL generation
+- Self-improving from `history.db`
+- No external API costs
+
+Initial work shipped (commits `35a378e`, `1bf17db`):
+- LLM-free baseline with TF-IDF intent classifier, rapidfuzz + WordNet
+  schema matcher, sqlglot AST builder, Postgres read-only executor
+- Implicit value detection, cross-table WHERE, "total X" heuristic
+- 54 tests passing
+
+### Phase 2 — Seven-paper literature review
+
+User pushed seven papers (A–G) to assess additional ideas. Detailed in
+the long sections above. Net contribution:
+
+- **B (SQLizer)** — sketch IR + repair loop + top-K (foundational architecture)
+- **A.T1a (SQL-PaLM)** — DB content matching (real-value resolution)
+- **C (Survey, MISP)** — interactive top-K disambiguation
+- **D (SQL-R1)** — multi-component scoring recipe
+- **E, F, G** — corroborative; one minor metric (SER) from G
+
+### Phase 3 — The LLM-as-build-oracle pivot
+
+Realising the constraint was "no LLM at runtime", user proposed using an
+LLM at *build time* (offline) to enrich schema, generate seed corpus,
+etc. The LLM never enters production. Plan: 6 offline tools costing
+under $20 lifetime.
+
+User shared OpenAI API key. **Two key leaks happened**:
+
+| Incident | Cause | Recovery |
+|---|---|---|
+| Leak #1 | User pasted live `sk-proj-...` key directly into chat | Refused to use; advised revocation; key was added to `.env` correctly |
+| Leak #2 | User pasted second key into `.env.example` (a tracked file) | Caught before commit; revoked; advised correct path is `.env` (gitignored) |
+
+Lessons captured in committed `.env.example` template (no real keys) and
+in `tools/README.md` security section. Both leaked keys revoked by user.
+
+Final secure setup: key lives in `.claude/.env` (gitignored), variable
+name `OPENAI_API_KEY`. Tools auto-detect either `.env` or `.claude/.env`.
+
+### Phase 4 — Tool design + error-checked rebuild
+
+Built `tools/_common.py`, `_prompts.py`, `_validate.py`,
+`annotate_schema.py`, `apply_annotations.py`, `requirements.txt`,
+`README.md`. Five real bugs caught during pre-implementation review:
+
+1. `python-dotenv` was set to read `.env` only — wouldn't find the key in `.claude/.env`
+2. `openai`, `ruamel.yaml` not in any requirements file
+3. PyYAML round-trip would destroy comments in schema YAML
+4. No defined merge flow for proposed annotations → risk of overwriting
+5. Cache key was just prompt content → stale on prompt template change
+
+All fixed in committed code. See `4298a0d` for the design + corrections.
+
+### Phase 5 — Trial LLM annotation
+
+Ran `tools/annotate_schema.py` on 5 real tables (Client, Organization,
+Driver, Tour, Invoice). Verified end-to-end:
+
+- Cost: **$0.0021** actual (vs $0.0029 estimated)
+- Wall time: ~5 seconds
+- Output quality: usable; correct identifications for GSTIN, PAN, PIN,
+  paymentTerm, mobile; conservative (under-suggested vs over-suggested)
+- One YAML-encoding bug caught and fixed (ruamel emitting unicode chars
+  while PyYAML used `\u` escapes — clean diff property restored)
+
+### Phase 6 — User pushback: "I need 0 LLM interaction"
+
+After two key leaks and seeing LLM output is *fine but not magical*,
+user pulled back to a stricter constraint: **no LLM at all, even at
+build time**.
+
+Honest reassessment: every LLM tool in the plan has a deterministic
+alternative. The LLM was a labor-saving convenience, not a necessity.
+
+### Phase 7 — Deterministic annotator (commit `fb4f7ef`)
+
+Built `tools/auto_annotate.py` + `tools/_acronyms.py`. Generates
+descriptions and synonyms using ONLY:
+
+1. camelCase / snake_case splitting (`paymentTerm` → "payment term")
+2. Built-in business-acronym lookup table covering Indian
+   tax/finance/government codes (GSTIN, PAN, PIN, TDS, IFSC, UPI) and
+   generic SaaS/commerce abbreviations
+3. Per-word synonym dictionary (phone↔mobile, payment↔billing, etc.)
+4. NLTK WordNet expansion for single-word common nouns, with
+   proper-noun and sense-disambiguation filters
+5. Composite generation (`Client` + `name` → "client name")
+
+Cost comparison on 5-table slice:
+
+|  | LLM (gpt-4o-mini) | Deterministic |
+|---|---|---|
+| API calls | 1 | 0 |
+| Cost | $0.0021 | $0.0000 |
+| Wall time | ~5 s | <1 s |
+| Synonyms generated | ~80 | 246 (over 152 columns) |
+| Network dependency | Yes | None |
+| Leak risk | Live API key on disk | None |
+| Reproducibility | Cached, stochastic underneath | Fully deterministic |
+
+### Phase 8 — Matcher bugs caught during verification
+
+Applying auto-annotated schema and re-testing the matcher exposed two
+bugs that had been latent:
+
+**Bug A: WordNet expansion on action verbs created false matches.**
+Example: query "show clients with gstn" → matcher matched
+`Client.profilePic` because "show" expanded via WordNet to "picture",
+and `profilePic`'s synonyms list contained "picture".
+
+Fix: introduced `_CONTROL_VERBS` frozenset in `app/nlp/matcher.py`
+blocking WordNet expansion of common SQL action words (show, list,
+find, count, top, all, etc.). Also limited WordNet to top-2 senses and
+filtered proper-noun lemmas (uppercase characters in raw form) to
+suppress geographic / archaic-sense artefacts ("Mobile River", "gens",
+"netmail").
+
+**Bug B: Multi-word synonyms ("tax id", "gst number") never matched.**
+Example: "find clients by tax id" → matched generic `id` column instead
+of GSTIN, because the matcher only checked single-token lemmas against
+declared synonyms. The annotated `Client.GSTIN.synonyms` had "tax id"
+as one entry, but the user's tokens "tax" and "id" matched separately.
+
+Fix: `score_columns` now also builds bigrams from consecutive tokens
+and checks them against declared synonyms with a higher score (12.0)
+than single-token exact (10.0). So "tax id" as a phrase outranks
+"id" alone.
+
+### Phase 9 — Verification (commit `fb4f7ef`)
+
+After auto-annotations applied + matcher fixes, ran 10 representative
+queries that each address a different match path:
+
+| Query | Top-1 match | Mechanism |
+|---|---|---|
+| `show clients with gstn` | GSTIN | fuzzy (rapidfuzz) |
+| `find clients by tax id` | GSTIN | bigram synonym |
+| `list clients with vat number` | GSTIN | single synonym |
+| `clients having pan` | PAN | exact part match |
+| `show clients with payment term 30` | paymentTerm | bigram synonym |
+| `clients with phone` | mobile | single synonym |
+| `clients by postal code` | PIN | bigram synonym |
+| `show me clients with gst number` | GSTIN | bigram synonym |
+| `clients with tax id` | GSTIN | bigram synonym |
+| `list clients with gst id` | GSTIN | bigram synonym |
+
+**10/10 routed correctly. Zero LLM. Zero cost.**
+
+Existing 54-test suite still passing.
+
+### Phase 10 — Git identity / push credential question
+
+User noted multiple stored credentials (sailwemotive1/2/3 and a numeric
+21238971). Pushes only succeed with the numeric credential — that token
+is the one with write access to `sailkargutkar/docker-nl2sql` and is
+almost certainly a Personal Access Token belonging to the sailkargutkar
+GitHub account.
+
+Status: pushes go through correctly; the GitHub UI attributes them to
+sailkargutkar (the token owner). If the *commit author* should also be
+sailkargutkar (currently `sailwemotive`), `git config user.name` change
+is a one-liner — pending user direction.
+
+---
+
+## Cumulative ship log (this branch)
+
+| Commit | Type | Summary |
+|---|---|---|
+| `35a378e` | feat | initial self-sustaining nl2sql baseline |
+| `1bf17db` | feat | implicit values, cross-table WHERE, "total X" intent |
+| `b5a7db6` | docs | research notes A–G consolidated |
+| `54e4df5` | docs | per-paper attribution conclusion |
+| `4921b3b` | docs | UI wireframes for the four-stage system |
+| `811a956` | docs | improvement analysis + LLM-as-build-oracle pivot |
+| `4298a0d` | docs | tool design — error-checked, with corrections |
+| `3d6a900` | feat | LLM-as-build-oracle infrastructure + annotate_schema |
+| `fb4f7ef` | feat | **deterministic schema annotator (no LLM, no cost)** |
+
+The `fb4f7ef` commit is the inflection point — after that, the build-time
+LLM tools become **opt-in** rather than the recommended default.
+
+---
+
+## Final position on LLM use
+
+| Question | Answer |
+|---|---|
+| Does the runtime use an LLM? | **No, never.** That was the original constraint and remains true. |
+| Does the build-time toolchain use an LLM? | **Optional, opt-in.** `tools/auto_annotate.py` is the no-LLM default; `tools/annotate_schema.py` (LLM) is left in place for users who want the convenience. |
+| What does the LLM tool buy you if you do use it? | Slightly broader synonym coverage in domains the built-in acronym table doesn't anticipate (e.g. medical-record codes that aren't in `tools/_acronyms.py`). |
+| What's the recommended path forward? | Use `tools/auto_annotate.py` by default. Add new entries to `tools/_acronyms.py` for any abbreviations specific to your domain. Reach for `annotate_schema.py` only when you genuinely need broader semantic coverage. |
+| What about the leaked keys? | Both revoked. New key in `.claude/.env` (gitignored). `.env.example` cleaned. `.gitignore` covers `.env`, `.claude/.env`, `tools/.cache/`, `schema/*.proposed.yml`, `schema/*.yml.bak.*`. |
+
+---
+
+## Open items / next decisions
+
+| Item | Status | Owner |
+|---|---|---|
+| Stage 1 — sketch + repair loop (Paper B) | Not started | next ship |
+| Stage 2 — execution-guided + multi-component scoring | Not started | after Stage 1 |
+| Stage 3 — DB content value matching (Paper A.T1a) | Not started | after Stage 1 |
+| Stage 4 — MISP top-K UI | Not started | after Stage 1 |
+| SER metric (Paper G) | Not started | bonus, any time |
+| Auto-annotate the remaining 88 tables | Run-when-ready (it's free) | user choice |
+| Commit author identity | Currently `sailwemotive`; can change to `sailkargutkar` per user preference | pending direction |
+| Deterministic active-labeling loop | Pattern same as MISP — likely covered when Stage 4 ships | with Stage 4 |
