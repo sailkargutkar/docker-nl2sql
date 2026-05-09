@@ -140,13 +140,14 @@ def validate_and_rewrite(
     sql: str,
     schema: Schema,
     max_rows: int,
+    dialect: str = "postgres",
 ) -> ValidationResult:
     sql = (sql or "").strip().rstrip(";").strip()
     if not sql:
         raise ValidationError("Empty SQL.")
 
     try:
-        statements = sqlglot.parse(sql, read="postgres")
+        statements = sqlglot.parse(sql, read=dialect)
     except sqlglot.errors.ParseError as e:
         raise ValidationError(f"SQL failed to parse: {e}") from e
 
@@ -191,7 +192,7 @@ def validate_and_rewrite(
         if existing is None:
             tree.set("limit", exp.Limit(expression=exp.Literal.number(max_rows)))
 
-    rewritten = tree.sql(dialect="postgres")
+    rewritten = tree.sql(dialect=dialect)
     return ValidationResult(
         sql=rewritten,
         tables_used=sorted(set(referenced)),

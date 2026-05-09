@@ -31,6 +31,7 @@ class ActiveDB:
     url: str
     schema_file: str
     table_count: int
+    dialect: str = "postgres"
 
 
 def _resolve_active() -> ActiveDB:
@@ -42,12 +43,14 @@ def _resolve_active() -> ActiveDB:
             url=entry.url(),
             schema_file=entry.schema_file,
             table_count=entry.table_count,
+            dialect=entry.dialect,
         )
     return ActiveDB(
         name=settings.effective_db_name or "default",
         url=settings.db_url,
         schema_file=settings.schema_file,
         table_count=0,
+        dialect="postgres",
     )
 
 
@@ -144,7 +147,8 @@ def ask(req: AskRequest) -> AskResponse:
 
     try:
         gen = generate_sql(
-            req.question, schema, settings.max_rows, settings.intent_model_path
+            req.question, schema, settings.max_rows,
+            settings.intent_model_path, dialect=active.dialect,
         )
     except Exception as e:  # noqa: BLE001
         history.record(
@@ -175,7 +179,9 @@ def ask(req: AskRequest) -> AskResponse:
         )
 
     try:
-        validated = validate_and_rewrite(gen.sql, schema, settings.max_rows)
+        validated = validate_and_rewrite(
+            gen.sql, schema, settings.max_rows, dialect=active.dialect,
+        )
     except ValidationError as e:
         history.record(
             settings.history_db,
@@ -280,6 +286,7 @@ class DatabaseCreate(BaseModel):
     username: str = Field(min_length=1)
     password: str = ""
     activate: bool = True
+    dialect: str = "postgres"  # 'postgres' or 'mysql'
 
 
 _IN_DOCKER = Path("/.dockerenv").exists()
@@ -294,8 +301,13 @@ def _normalize_host(host: str) -> str:
     return host
 
 
-def _build_url(host: str, port: int, dbname: str, username: str, password: str) -> str:
+def _build_url(
+    host: str, port: int, dbname: str, username: str, password: str,
+    dialect: str = "postgres",
+) -> str:
     host = _normalize_host(host)
+    if dialect == "mysql":
+        return f"mysql+pymysql://{username}:{password}@{host}:{port}/{dbname}"
     return f"postgresql+psycopg2://{username}:{password}@{host}:{port}/{dbname}"
 
 
@@ -319,15 +331,27 @@ def add_database(req: DatabaseCreate) -> dict[str, Any]:
     if db_registry.get_by_name(settings.registry_db, req.name) is not None:
         raise HTTPException(409, f"A database named '{req.name}' is already configured.")
 
+    if req.dialect not in db_registry.SUPPORTED_DIALECTS:
+        raise HTTPException(
+            400,
+            f"Unsupported dialect '{req.dialect}'. "
+            f"Must be one of: {', '.join(db_registry.SUPPORTED_DIALECTS)}",
+        )
+
     resolved_host = _normalize_host(req.host)
-    url = _build_url(resolved_host, req.port, req.dbname, req.username, req.password)
+    url = _build_url(
+        resolved_host, req.port, req.dbname, req.username, req.password,
+        dialect=req.dialect,
+    )
     _verify_connection(url)
 
     safe = db_registry.sanitize_name(req.name)
     schema_path = SCHEMA_DIR / f"{safe}.yml"
 
     try:
-        table_count = schema_introspect.generate_and_write(url, schema_path, req.dbname)
+        table_count = schema_introspect.generate_and_write(
+            url, schema_path, req.dbname, dialect=req.dialect,
+        )
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"Schema generation failed: {e}") from e
 
@@ -341,6 +365,7 @@ def add_database(req: DatabaseCreate) -> dict[str, Any]:
         password=req.password,
         schema_file=str(schema_path),
         table_count=table_count,
+        dialect=req.dialect,
     )
 
     if req.activate:
@@ -366,7 +391,10 @@ def regenerate_database(name: str) -> dict[str, Any]:
     if entry is None:
         raise HTTPException(404, f"No database named '{name}'.")
     try:
-        count = schema_introspect.generate_and_write(entry.url(), Path(entry.schema_file), entry.dbname)
+        count = schema_introspect.generate_and_write(
+            entry.url(), Path(entry.schema_file), entry.dbname,
+            dialect=entry.dialect,
+        )
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"Schema generation failed: {e}") from e
     db_registry.update_table_count(settings.registry_db, name, count)

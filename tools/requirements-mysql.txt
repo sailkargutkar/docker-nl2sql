@@ -1,0 +1,10 @@
+# MySQL introspection — additional dev-only dependency.
+# Install only if you want to introspect a MySQL database into the
+# YAML schema format expected by auto_annotate.py.
+#
+#   pip install -r tools/requirements-mysql.txt
+#
+# This package is NOT installed in the production Docker image and is
+# unrelated to the (Postgres-only) runtime stack.
+
+PyMySQL==1.1.1

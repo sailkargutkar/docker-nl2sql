@@ -1,12 +1,17 @@
 """
 Read-only query executor.
 
-Every connection enforces:
-  - default_transaction_read_only = on   (Postgres itself will reject any DML)
-  - statement_timeout                    (hard wall-clock cap per query)
+Every connection enforces, per dialect:
+  Postgres:
+    - default_transaction_read_only = on
+    - statement_timeout
+    - idle_in_transaction_session_timeout
+  MySQL:
+    - SESSION TRANSACTION READ ONLY
+    - max_execution_time (in ms)
 
 This is the last line of defense behind the validator. Even if a malformed
-UPDATE somehow got past sqlglot, Postgres would refuse to execute it.
+UPDATE somehow got past sqlglot, the database would refuse to execute it.
 """
 
 from __future__ import annotations
@@ -18,6 +23,13 @@ from typing import Any
 
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
+
+
+def detect_dialect(url: str) -> str:
+    """Return 'postgres' or 'mysql' from a SQLAlchemy URL prefix."""
+    if url.startswith("mysql"):
+        return "mysql"
+    return "postgres"
 
 
 @dataclass
@@ -33,7 +45,7 @@ _engines: dict[tuple[str, int], Engine] = {}
 
 
 def _build_engine(url: str, statement_timeout_ms: int) -> Engine:
-    # Do NOT pass statement_timeout via startup options ("-c ..."): pgbouncer
+    # Do NOT pass session settings via startup options ("-c ..."): pgbouncer
     # in transaction/statement pooling mode rejects unknown startup params.
     # Apply all session settings post-connect instead.
     engine = create_engine(
@@ -43,12 +55,23 @@ def _build_engine(url: str, statement_timeout_ms: int) -> Engine:
         max_overflow=2,
     )
 
+    dialect = detect_dialect(url)
+
     @event.listens_for(engine, "connect")
     def _set_session(dbapi_connection, _):
         with dbapi_connection.cursor() as cur:
-            cur.execute("SET default_transaction_read_only = on")
-            cur.execute(f"SET statement_timeout = {int(statement_timeout_ms)}")
-            cur.execute("SET idle_in_transaction_session_timeout = 30000")
+            if dialect == "mysql":
+                # MySQL 5.7+: max_execution_time in milliseconds (SELECT only).
+                cur.execute("SET SESSION TRANSACTION READ ONLY")
+                cur.execute(
+                    f"SET SESSION max_execution_time = {int(statement_timeout_ms)}"
+                )
+            else:
+                cur.execute("SET default_transaction_read_only = on")
+                cur.execute(
+                    f"SET statement_timeout = {int(statement_timeout_ms)}"
+                )
+                cur.execute("SET idle_in_transaction_session_timeout = 30000")
 
     return engine
 

@@ -102,6 +102,7 @@ def generate_sql(
     schema: Schema,
     max_rows: int,
     intent_model_path: str,
+    dialect: str = "postgres",
 ) -> GenerationResult:
     pre = preprocess(question)
     values = extract(question, pre.quoted_literals)
@@ -151,6 +152,7 @@ def generate_sql(
             values=values,
             max_rows=max_rows,
             implicit_values=implicit_values,
+            dialect=dialect,
         )
     except BuildError as e:
         return GenerationResult(

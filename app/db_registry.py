@@ -30,10 +30,14 @@ CREATE TABLE IF NOT EXISTS databases (
     schema_file TEXT NOT NULL,
     table_count INTEGER DEFAULT 0,
     is_active INTEGER DEFAULT 0,
+    dialect TEXT NOT NULL DEFAULT 'postgres',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 """
+
+
+SUPPORTED_DIALECTS = ("postgres", "mysql")
 
 
 @dataclass
@@ -50,8 +54,14 @@ class DatabaseEntry:
     is_active: bool
     created_at: str
     updated_at: str
+    dialect: str = "postgres"
 
     def url(self) -> str:
+        if self.dialect == "mysql":
+            return (
+                f"mysql+pymysql://{self.username}:{self.password}"
+                f"@{self.host}:{self.port}/{self.dbname}"
+            )
         return (
             f"postgresql+psycopg2://{self.username}:{self.password}"
             f"@{self.host}:{self.port}/{self.dbname}"
@@ -67,6 +77,15 @@ def init(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with _conn(path) as c:
         c.executescript(SCHEMA)
+        # Idempotent migration for installs that pre-date the dialect column.
+        existing_cols = {
+            r[1] for r in c.execute("PRAGMA table_info(databases)").fetchall()
+        }
+        if "dialect" not in existing_cols:
+            c.execute(
+                "ALTER TABLE databases ADD COLUMN dialect TEXT "
+                "NOT NULL DEFAULT 'postgres'"
+            )
 
 
 @contextmanager
@@ -124,15 +143,23 @@ def insert(
     password: str,
     schema_file: str,
     table_count: int,
+    dialect: str = "postgres",
 ) -> DatabaseEntry:
+    if dialect not in SUPPORTED_DIALECTS:
+        raise ValueError(
+            f"Unsupported dialect '{dialect}'. "
+            f"Must be one of: {', '.join(SUPPORTED_DIALECTS)}"
+        )
     with _conn(path) as c:
         c.execute(
             """
             INSERT INTO databases
-                (name, host, port, dbname, username, password, schema_file, table_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (name, host, port, dbname, username, password,
+                 schema_file, table_count, dialect)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (name, host, port, dbname, username, password, schema_file, table_count),
+            (name, host, port, dbname, username, password,
+             schema_file, table_count, dialect),
         )
     entry = get_by_name(path, name)
     assert entry is not None

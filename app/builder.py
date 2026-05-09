@@ -370,6 +370,7 @@ def build(
     values: ExtractedValues,
     max_rows: int,
     implicit_values: list[ImplicitValue] | None = None,
+    dialect: str = "postgres",
 ) -> BuildResult:
     implicit_values = implicit_values or []
     primary = _primary_table(table_scores, column_matches)
@@ -480,7 +481,7 @@ def build(
     else:
         select = select.limit(exp.Literal.number(max_rows), copy=False)
 
-    sql = select.sql(dialect="postgres")
+    sql = select.sql(dialect=dialect)
     conf = 0.8 if where is not None else 0.6
     if intent in ("sum", "avg", "min", "max", "top"):
         conf += 0.05

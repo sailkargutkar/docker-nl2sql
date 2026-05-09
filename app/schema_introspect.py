@@ -1,7 +1,8 @@
-"""Introspect a live Postgres database into the DSL format.
+"""Introspect a live Postgres or MySQL database into the DSL format.
 
-Same logic as scripts/bootstrap_schema.py, factored out so the API can call it
-when a user adds/regenerates a DB from the UI.
+Factored out of scripts/bootstrap_schema.py so the API can call it
+when a user adds/regenerates a DB from the UI. Dialect is detected
+from the SQLAlchemy URL prefix (or explicitly passed).
 """
 
 from __future__ import annotations
@@ -32,12 +33,142 @@ TYPE_MAP = {
     "USER-DEFINED": "enum",
 }
 
-BOOKKEEPING_COLS = {
-    "revision", "enabled", "createdAt", "updatedAt", "createdBy", "updatedBy",
+
+# MySQL types differ from Postgres; map onto the same DSL vocabulary.
+MYSQL_TYPE_MAP = {
+    "tinyint":     "boolean",  # tinyint(1) is the boolean convention
+    "smallint":    "smallint",
+    "mediumint":   "integer",
+    "int":         "integer",
+    "integer":     "integer",
+    "bigint":      "bigint",
+    "decimal":     "numeric",
+    "numeric":     "numeric",
+    "float":       "float",
+    "double":      "float",
+    "real":        "float",
+    "char":        "string",
+    "varchar":     "string",
+    "tinytext":    "string",
+    "text":        "text",
+    "mediumtext":  "text",
+    "longtext":    "text",
+    "enum":        "enum",
+    "set":         "enum",
+    "date":        "date",
+    "time":        "string",
+    "datetime":    "timestamp",
+    "timestamp":   "timestamptz",
+    "year":        "integer",
+    "binary":      "string",
+    "varbinary":   "string",
+    "blob":        "string",
+    "tinyblob":    "string",
+    "mediumblob":  "string",
+    "longblob":    "string",
+    "json":        "jsonb",
 }
 
 
-def introspect(url: str) -> list[dict]:
+def _detect_dialect_from_url(url: str) -> str:
+    return "mysql" if url.startswith("mysql") else "postgres"
+
+
+def _map_mysql_type(data_type: str, column_type: str) -> str:
+    base = (data_type or "").lower()
+    full = (column_type or "").lower()
+    if base == "tinyint":
+        return "boolean" if "tinyint(1)" in full else "smallint"
+    return MYSQL_TYPE_MAP.get(base, base or "unknown")
+
+
+BOOKKEEPING_COLS = {
+    "revision", "enabled", "createdAt", "updatedAt", "createdBy", "updatedBy",
+    "created_at", "updated_at", "created_by", "updated_by",
+    "deleted_at", "deletedAt",
+}
+
+
+def introspect(url: str, dialect: str | None = None) -> list[dict]:
+    if dialect is None:
+        dialect = _detect_dialect_from_url(url)
+    if dialect == "mysql":
+        return _introspect_mysql(url)
+    return _introspect_postgres(url)
+
+
+def _introspect_mysql(url: str) -> list[dict]:
+    """MySQL information_schema differs slightly from Postgres."""
+    from sqlalchemy.engine.url import make_url
+    db_name = make_url(url).database
+    engine = create_engine(url)
+    with engine.connect() as conn:
+        cols = conn.execute(
+            text(
+                """
+                SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE,
+                       ORDINAL_POSITION
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = :schema
+                ORDER BY TABLE_NAME, ORDINAL_POSITION
+                """
+            ),
+            {"schema": db_name},
+        ).fetchall()
+
+        pks_raw = conn.execute(
+            text(
+                """
+                SELECT TABLE_NAME, COLUMN_NAME
+                FROM information_schema.KEY_COLUMN_USAGE
+                WHERE TABLE_SCHEMA = :schema
+                  AND CONSTRAINT_NAME = 'PRIMARY'
+                """
+            ),
+            {"schema": db_name},
+        ).fetchall()
+        pk_set = {(r[0], r[1]) for r in pks_raw}
+
+        fks_raw = conn.execute(
+            text(
+                """
+                SELECT TABLE_NAME, COLUMN_NAME,
+                       REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+                FROM information_schema.KEY_COLUMN_USAGE
+                WHERE TABLE_SCHEMA = :schema
+                  AND REFERENCED_TABLE_NAME IS NOT NULL
+                """
+            ),
+            {"schema": db_name},
+        ).fetchall()
+        fk_map = {(r[0], r[1]): f"{r[2]}.{r[3]}" for r in fks_raw}
+
+    tables_raw: dict[str, list[dict]] = {}
+    for table_name, col_name, data_type, column_type, _ in cols:
+        tables_raw.setdefault(table_name, []).append({
+            "name": col_name,
+            "type": _map_mysql_type(data_type, column_type),
+            "pk": (table_name, col_name) in pk_set,
+            "fk": fk_map.get((table_name, col_name)),
+        })
+
+    out: list[dict] = []
+    for name, columns in tables_raw.items():
+        clean_cols = []
+        for c in columns:
+            entry = {"name": c["name"], "type": c["type"]}
+            if c["pk"]:
+                entry["pk"] = True
+            if c["fk"]:
+                entry["fk"] = c["fk"]
+            clean_cols.append(entry)
+        out.append({"name": name, "description": "", "columns": clean_cols})
+    out.sort(key=lambda t: t["name"])
+    _annotate_junction_tables(out)
+    return out
+
+
+def _introspect_postgres(url: str) -> list[dict]:
     engine = create_engine(url)
     with engine.connect() as conn:
         cols = conn.execute(
@@ -147,9 +278,12 @@ def _annotate_junction_tables(tables: list[dict]) -> None:
                 })
 
 
-def generate_and_write(url: str, out_path: Path, db_name: str) -> int:
+def generate_and_write(
+    url: str, out_path: Path, db_name: str,
+    dialect: str | None = None,
+) -> int:
     """Introspect `url` and write the DSL YAML to `out_path`. Returns table count."""
-    tables = introspect(url)
+    tables = introspect(url, dialect=dialect)
     doc = {
         "database": db_name,
         "description": "Auto-generated by nl2sql — edit descriptions/synonyms as needed.",
