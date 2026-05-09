@@ -1,0 +1,261 @@
+database: jodhpur
+description: "Auto-introspected from MySQL by tools/introspect_mysql.py \u2014 edit descriptions/synonyms or run `python tools/auto_annotate.py
+  --schema schema/jodhpur.yml`."
+tables:
+- name: auxproduct
+  description: Auxproduct.
+  columns:
+  - name: id
+    type: integer
+    pk: true
+    description: "Primary key \u2014 id."
+  - name: channelId
+    type: string
+    description: "channel id \u2014 free-text value."
+    synonyms:
+    - channel id
+  - name: menuSetId
+    type: string
+    description: "menu set id \u2014 free-text value."
+    synonyms:
+    - menu set id
+  - name: productId
+    type: string
+    description: "product id \u2014 free-text value."
+    synonyms:
+    - product id
+- name: config
+  description: Config.
+  columns:
+  - name: keyname
+    type: string
+    pk: true
+    description: "Primary key \u2014 keyname."
+  - name: keyvalue
+    type: text
+    description: "keyvalue \u2014 free-text value."
+    synonyms: []
+- name: electronnotifications
+  description: Electronnotifications.
+  columns:
+  - name: notif_id
+    type: string
+    pk: true
+    description: "Primary key \u2014 notif id."
+  - name: value
+    type: text
+    description: "value \u2014 free-text value."
+    synonyms: []
+- name: onlineorders
+  description: Onlineorders.
+  columns:
+  - name: id
+    type: bigint
+    pk: true
+    description: "Primary key \u2014 id."
+  - name: orderId
+    type: string
+    description: "order id \u2014 free-text value."
+    synonyms:
+    - order id
+  - name: channelId
+    type: string
+    description: "channel id \u2014 free-text value."
+    synonyms:
+    - channel id
+  - name: orderJson
+    type: text
+    description: "order json \u2014 free-text value."
+    synonyms:
+    - order json
+  - name: placedTime
+    type: timestamp
+    description: "placed time \u2014 date and time."
+  - name: paymentStatus
+    type: string
+    description: "payment status \u2014 free-text value."
+    synonyms:
+    - payment status
+    - billing
+    - pay
+  - name: channelStatus
+    type: string
+    description: "channel status \u2014 free-text value."
+    synonyms:
+    - channel status
+  - name: postreeStatus
+    type: integer
+    description: "postree status \u2014 integer value."
+    synonyms:
+    - postree status
+  - name: postreeTicketId
+    type: integer
+    description: "postree ticket id \u2014 integer value."
+    synonyms:
+    - postree ticket id
+  - name: createdAt
+    type: timestamp
+    description: "created at \u2014 date and time."
+  - name: updatedAt
+    type: timestamp
+    description: "updated at \u2014 date and time."
+- name: products
+  description: Products.
+  columns:
+  - name: id
+    type: string
+    pk: true
+    description: "Primary key \u2014 id."
+  - name: reference
+    type: string
+    description: "reference \u2014 free-text value."
+    synonyms:
+    - mention
+  - name: code
+    type: string
+    description: "code \u2014 free-text value."
+    synonyms:
+    - identifier
+    - codification
+    - products code
+  - name: codetype
+    type: string
+    description: "codetype \u2014 free-text value."
+    synonyms: []
+  - name: name
+    type: string
+    description: "name \u2014 free-text value."
+    synonyms:
+    - title
+    - label
+    - products name
+  - name: pricebuy
+    type: numeric
+    description: "pricebuy \u2014 decimal number."
+    synonyms: []
+  - name: pricesell
+    type: numeric
+    description: "pricesell \u2014 decimal number."
+    synonyms: []
+  - name: category
+    type: string
+    description: "category \u2014 free-text value."
+    synonyms:
+    - type
+    - kind
+    - group
+    - class
+    - family
+  - name: taxcat
+    type: string
+    fk: taxCategories.id
+    description: Foreign key to taxCategories.id.
+  - name: attributeset_id
+    type: string
+    description: "attributeset id \u2014 free-text value."
+    synonyms:
+    - attributeset id
+  - name: stockcost
+    type: numeric
+    description: "stockcost \u2014 decimal number."
+    synonyms: []
+  - name: stockvolume
+    type: numeric
+    description: "stockvolume \u2014 decimal number."
+    synonyms: []
+  - name: image
+    type: string
+    description: "image \u2014 free-text value."
+    synonyms:
+    - mental image
+  - name: iscom
+    type: boolean
+    description: "iscom \u2014 yes/no flag."
+    synonyms: []
+  - name: isscale
+    type: boolean
+    description: "isscale \u2014 yes/no flag."
+    synonyms: []
+  - name: isconstant
+    type: boolean
+    description: "isconstant \u2014 yes/no flag."
+    synonyms: []
+  - name: printkb
+    type: boolean
+    description: "printkb \u2014 yes/no flag."
+    synonyms: []
+  - name: sendstatus
+    type: boolean
+    description: "sendstatus \u2014 yes/no flag."
+    synonyms: []
+  - name: isservice
+    type: boolean
+    description: "isservice \u2014 yes/no flag."
+    synonyms: []
+  - name: isvprice
+    type: boolean
+    description: "isvprice \u2014 yes/no flag."
+    synonyms: []
+  - name: isverpatrib
+    type: boolean
+    description: "isverpatrib \u2014 yes/no flag."
+    synonyms: []
+  - name: texttip
+    type: string
+    description: "texttip \u2014 free-text value."
+    synonyms: []
+  - name: warranty
+    type: integer
+    description: "warranty \u2014 integer value."
+    synonyms:
+    - guarantee
+    - warrant
+    - warrantee
+  - name: stockunits
+    type: numeric
+    description: "stockunits \u2014 decimal number."
+    synonyms: []
+  - name: printto
+    type: string
+    description: "printto \u2014 free-text value."
+    synonyms: []
+  - name: supplier
+    type: string
+    description: "supplier \u2014 free-text value."
+    synonyms:
+    - provider
+  - name: uom
+    type: string
+    description: "uom \u2014 free-text value."
+    synonyms: []
+  - name: memodate
+    type: timestamp
+    description: "memodate \u2014 date and time."
+- name: taxCategories
+  description: Tax categories.
+  columns:
+  - name: id
+    type: string
+    pk: true
+    description: "Primary key \u2014 id."
+  - name: name
+    type: string
+    description: "name \u2014 free-text value."
+    synonyms:
+    - title
+    - label
+    - tax categories name
+- name: taxcategories
+  description: Taxcategories.
+  columns:
+  - name: id
+    type: string
+    pk: true
+    description: "Primary key \u2014 id."
+  - name: name
+    type: string
+    description: "name \u2014 free-text value."
+    synonyms:
+    - title
+    - label
+    - taxcategories name
