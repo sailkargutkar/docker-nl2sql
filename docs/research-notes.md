@@ -1907,3 +1907,73 @@ dd73a1e  feat: MySQL support
 | Repair tactics | ⏳ Phase 17 (planned) |
 | Execution-guided ranking | ⏳ Phase 17 (planned) |
 | Teach-back loop (`/api/teach`) | ⏳ Phase 18 (planned) |
+
+---
+
+## Phase 16a — Multi-table LIST (`X with their Y` JOIN)
+
+Surfaced during Phase-16 live testing on jodhpur: user typed
+"Show all categories with their products" and got back **only categories**
+(`SELECT categories.id, categories.name, …`) — the builder picked one
+primary table and projected its columns, ignoring the relationship the
+user clearly wanted.
+
+### Fix
+
+[app/builder.py](../app/builder.py) — new helper
+`_detect_secondary_for_list()` runs at the top of the LIST intent
+branch. Fires when:
+
+1. A non-primary table appears in the top-3 `table_scores`
+2. Its score is ≥ 60% of the primary's
+3. There's a declared FK path between the two (`resolve_join_path`)
+
+When all three are true:
+- Project default columns from **both** tables (4 each, capped)
+- Add the secondary to `referenced_tables` so `_apply_joins` emits
+  the `INNER JOIN ... ON pk = fk` automatically
+
+When any is false → existing single-table behaviour, unchanged.
+
+### Live verification
+
+```sql
+-- Before the fix
+"Show all categories with their products"
+  → SELECT categories.id, categories.name, categories.parentid,
+           categories.image, categories.texttip, categories.catshowname
+    FROM categories LIMIT 500     -- only categories
+
+-- After the fix
+"Show all categories with their products"
+  → SELECT categories.id, categories.name, categories.parentid,
+           categories.image,
+           products.id, products.name, products.code, products.reference
+    FROM categories
+    INNER JOIN products ON categories.id = products.category
+    LIMIT 500                      -- both tables, JOINed via FK
+```
+
+### Tests (`tests/test_multi_table_list.py` — 6 new)
+
+- **TestMultiTableListJoin** (3): `with their`, `and their`,
+  bidirectional (`products with their category`).
+- **TestSingleTableListUnchanged** (3): plain `list X` stays
+  single-table; aggregates unaffected; no JOIN when there's no FK path
+  (regression guards).
+
+**111 / 111 tests passing** (was 105 — +6).
+
+### Why this stays safe
+
+The secondary-detection criteria are conservative — score floor of 60%
+of primary plus a *declared* FK path. A query like "list products" with
+no second table won't satisfy them. The negative-case tests in
+`TestSingleTableListUnchanged` lock that in.
+
+### Cumulative ship log
+
+```
+93e517c  feat(phase-16): top-K alternatives — generator + API + UI panel
+[next]   feat(phase-16a): multi-table LIST — JOIN when "X with their Y"
+```

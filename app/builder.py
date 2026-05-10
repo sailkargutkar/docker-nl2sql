@@ -374,6 +374,41 @@ def _first_numeric_column(matches: list[ColumnMatch], schema: Schema) -> ColumnM
     return None
 
 
+def _detect_secondary_for_list(
+    primary: str,
+    table_scores: list[tuple[str, float]],
+    schema: Schema,
+) -> str | None:
+    """Pick a secondary table for a multi-table LIST query.
+
+    Fires when:
+      1. A non-primary table appears in the top-3 score positions
+      2. That table's score is at least 60% of the primary's
+      3. There's a declared FK path between the two
+
+    The combination signals "user wants both entities" (e.g. "show
+    categories with their products"). Returns None for ordinary
+    single-table list queries — minimal false-positive risk.
+    """
+    if not table_scores:
+        return None
+    primary_score = next(
+        (s for t, s in table_scores if t.lower() == primary.lower()), 0.0
+    )
+    if primary_score <= 0:
+        return None
+    threshold = primary_score * 0.6
+    for table_name, score in table_scores[:3]:
+        if table_name.lower() == primary.lower():
+            continue
+        if score < threshold:
+            continue
+        if resolve_join_path(schema, primary, table_name) is None:
+            continue
+        return table_name
+    return None
+
+
 def _primary_table(
     table_scores: list[tuple[str, float]],
     column_matches: list[ColumnMatch],
@@ -521,18 +556,35 @@ def build(
         )
 
     else:  # "list" and any unknown falls here.
-        proj_cols = [m for m in column_matches if m.table == primary]
-        if proj_cols:
-            for m in proj_cols[:6]:
-                select = select.select(_column_ref(m.table, m.column), copy=False)
+        # Multi-table list detection: if a second table also scored high and
+        # is FK-connected to the primary, JOIN it and project columns from
+        # BOTH. Catches phrasings like "show categories with their products"
+        # where the user clearly wants both entities.
+        secondary = _detect_secondary_for_list(
+            primary, table_scores, schema,
+        )
+        if secondary:
+            for c in _default_list_columns(schema, primary, max_cols=4):
+                select = select.select(_column_ref(primary, c), copy=False)
+            for c in _default_list_columns(schema, secondary, max_cols=4):
+                select = select.select(_column_ref(secondary, c), copy=False)
+            referenced_tables.add(secondary)
+            explanation_bits.append(
+                f"list from {primary} joined with {secondary}"
+            )
         else:
-            defaults = _default_list_columns(schema, primary)
-            if not defaults:
-                select = select.select(exp.Star(), copy=False)
+            proj_cols = [m for m in column_matches if m.table == primary]
+            if proj_cols:
+                for m in proj_cols[:6]:
+                    select = select.select(_column_ref(m.table, m.column), copy=False)
             else:
-                for c in defaults:
-                    select = select.select(_column_ref(primary, c), copy=False)
-        explanation_bits.append(f"list from {primary}")
+                defaults = _default_list_columns(schema, primary)
+                if not defaults:
+                    select = select.select(exp.Star(), copy=False)
+                else:
+                    for c in defaults:
+                        select = select.select(_column_ref(primary, c), copy=False)
+            explanation_bits.append(f"list from {primary}")
 
     # WHERE — cross-table allowed. Any secondary tables the WHERE touches get
     # added to `referenced_tables` before joins are resolved.
