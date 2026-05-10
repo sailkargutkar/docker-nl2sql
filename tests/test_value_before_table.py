@@ -96,14 +96,20 @@ class TestValueBeforeTablePattern:
         assert by_value.get("pizza") == "categories"
 
     def test_three_token_pattern(self, shop_schema):
-        """`products in Snacks category` → categories.name='Snacks'."""
+        """`products in Snacks category` → categories.name LIKE '%Snacks%'.
+
+        Phase 16d: unquoted values now produce partial-match (LIKE/ILIKE)
+        instead of exact match — real DB values rarely equal a user's
+        typed noun verbatim ('Snacks' won't match 'Snacks(R)' with =).
+        """
         sql = generate_sql(
             "products in Snacks category",
             shop_schema, 100, "/tmp/none.joblib", dialect="mysql",
         ).sql
-        assert "categories" in sql.lower() and "'snacks'" in sql.lower()
-        # Should NOT also bind to products.name
-        assert sql.lower().count("'snacks'") == 1
+        assert "categories" in sql.lower()
+        assert "%snacks%" in sql.lower()
+        # Should NOT also bind to products.name with the same value
+        assert sql.lower().count("%snacks%") == 1
 
     def test_full_phrase(self, shop_schema):
         """`List all products under the Pizza category` end-to-end."""
@@ -114,9 +120,10 @@ class TestValueBeforeTablePattern:
         assert "JOIN" in sql.upper()
         assert "categories" in sql.lower()
         assert "products" in sql.lower()
-        assert "'pizza'" in sql.lower()
+        assert "%pizza%" in sql.lower()  # partial match
         # Should not have 'under' in any literal
         assert "'under" not in sql.lower()
+        assert "%under" not in sql.lower()
 
     def test_pattern_1_still_fires_when_no_trailing_table(self, shop_schema):
         """`list products acme` → products.name='acme' (Pattern 1)."""

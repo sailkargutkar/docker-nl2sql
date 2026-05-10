@@ -2271,3 +2271,115 @@ Q: Pizza category items                 → WHERE categories.name = 'Pizza' ✅
 ```
 [next]   feat(phase-16c): connective expansion + value-before-table pattern
 ```
+
+---
+
+## Phase 16d — partial match for unquoted string values (LIKE / ILIKE)
+
+User feedback after Phase 16c: the SQL was syntactically right but
+returned **zero rows**.
+
+```
+Q: List all products under the Pizza category
+SQL: WHERE categories.name = 'Pizza'    ← exact match
+DB:  Pizza(R), Veg Pizza, Pizza Tikka, …    ← no row literally equals 'Pizza'
+Result: 0 rows
+```
+
+The user's mental model is "find rows that **contain** Pizza", not
+"find rows that exactly equal 'Pizza'". The exact-match default is
+wrong for unquoted natural-language values.
+
+### Rule
+
+| Source of value | Operator | Why |
+|---|---|---|
+| Quoted (`'Pizza'`) | `=` | User typed quotes — explicit "exact" signal |
+| Unquoted (`Pizza category`) | `LIKE / ILIKE '%Pizza%'` | Natural-language, partial match expected |
+| Numeric / date / boolean | `=` (unchanged) | Exact comparison is the only sensible default |
+
+### Dialect
+
+| Dialect | Operator emitted | Why |
+|---|---|---|
+| Postgres | `ILIKE` | Built-in case-insensitive LIKE |
+| MySQL / MariaDB | `LIKE` | Already case-insensitive on default collations (`utf8mb4_unicode_ci`, `utf8mb4_general_ci`) |
+
+### Implementation
+
+**[app/builder.py](../app/builder.py)** new helpers:
+
+```python
+def _string_match(col_ref, value, dialect, exact: bool):
+    if exact:
+        return exp.EQ(this=col_ref, expression=_literal(value))
+    pattern = f"%{_escape_like(value)}%"
+    if dialect == "mysql":
+        return exp.Like(this=col_ref, expression=_literal(pattern))
+    return exp.ILike(this=col_ref, expression=_literal(pattern))
+
+def _escape_like(value):
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+```
+
+`_build_where`:
+- Implicit values (unquoted, e.g. `Pizza category`): `_string_match(..., exact=False)`.
+- Quoted strings (`values.quoted`): `_string_match(..., exact=True)`.
+- Booleans / numerics / dates: untouched (already use `=`).
+
+`_build_where` gains a `dialect` parameter; `build()` threads it through.
+
+### Wildcard-injection guard
+
+`_escape_like` neutralises `%` and `_` (and `\`) in user input. So
+"50%" doesn't become a wildcard catastrophe like `LIKE '%50%%'`
+matching every row. Tested in `TestEscapeLike`.
+
+### Live verification (bombayhouse, MariaDB)
+
+```
+Q: List all products under the Pizza category
+SQL: WHERE categories.name LIKE '%Pizza%'
+Result: 0 rows  (bombayhouse has no Pizza categories — data limit, not a bug)
+
+Q: show products with category Beverages
+SQL: WHERE categories.name LIKE '%Beverages%'
+Result: 8 rows ✅
+
+Q: products in Biryani category
+SQL: WHERE categories.name LIKE '%Biryani%'
+Result: 1 row ✅
+
+Q: products with name 'Pizza'         (quoted — user wants exact)
+SQL: WHERE products.name = 'Pizza'    (exact match preserved ✅)
+Result: 1 row
+```
+
+### Tests (`tests/test_partial_match.py` — 13 new)
+
+`TestStringMatchHelper` (4): exact vs partial, Postgres vs MySQL emitter.
+`TestEscapeLike` (4): no-special, %, _, backslash escaping.
+`TestPartialMatchEndToEnd` (5): unquoted → LIKE, quoted → =, ILIKE on
+Postgres, LIKE on MySQL, special-char escaping at end-to-end.
+
+Two existing tests in `tests/test_value_before_table.py` updated to
+expect `'%snacks%'` / `'%pizza%'` instead of the old `'snacks'` / `'pizza'`.
+
+**Total: 141 / 141 passing** (was 128; +13 new + 2 modified).
+
+### Edge cases worth noting
+
+- **Boolean predicates** (`are services`, `is paid`) still bind with `=`
+  on the boolean column — they're typed values, not strings.
+- **Negative-exists** (`without category`) still emits `IS NULL` — that's
+  a structural absence, not a value match.
+- **Numeric / date** filters from the value extractor still use `=` —
+  partial match doesn't make sense for them.
+- **UUID / id columns** can't be reached by implicit values (we only
+  bind to "name-like" string columns), so no concern there.
+
+### Cumulative ship log entry
+
+```
+[next]   feat(phase-16d): partial match (LIKE/ILIKE) for unquoted string values
+```

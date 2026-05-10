@@ -178,12 +178,40 @@ def _default_list_columns(schema: Schema, table: str, max_cols: int = 6) -> list
     return out[:max_cols]
 
 
+def _string_match(col_ref: exp.Expression, value: str, dialect: str, exact: bool) -> exp.Expression:
+    """WHERE clause for a string value.
+
+    - `exact=True` (user wrote a quoted literal): emit `= 'value'`.
+    - `exact=False` (unquoted, NL-derived value): emit case-insensitive
+      partial match. The user's mental model is "find rows that contain
+      this", not "exactly equals". Real DB values rarely match a typed
+      noun verbatim — `'Pizza'` won't match rows like `'Pizza(R)'` or
+      `'Veg Pizza'`, but `LIKE '%Pizza%'` will.
+
+    Postgres uses `ILIKE` (case-insensitive). MySQL/MariaDB use plain
+    `LIKE` which is already case-insensitive on default collations.
+    """
+    if exact:
+        return exp.EQ(this=col_ref, expression=_literal(value))
+    pattern = f"%{_escape_like(value)}%"
+    if dialect == "mysql":
+        return exp.Like(this=col_ref, expression=_literal(pattern))
+    return exp.ILike(this=col_ref, expression=_literal(pattern))
+
+
+def _escape_like(value: str) -> str:
+    """Escape LIKE wildcards so a literal `%` or `_` in user input
+    doesn't blow up the partial-match into a wildcard."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _build_where(
     schema: Schema,
     primary: str,
     columns: list[ColumnMatch],
     values: ExtractedValues,
     implicit_values: list[ImplicitValue],
+    dialect: str = "postgres",
 ) -> tuple[exp.Expression | None, list[str], list[str]]:
     """Construct WHERE from matched columns + typed values + implicit literals.
 
@@ -203,6 +231,7 @@ def _build_where(
             extra_tables.append(table)
 
     # Implicit values first — highest signal: user named an entity explicitly.
+    # These are UNQUOTED ("Pizza category"), so partial-match is the right default.
     for iv in implicit_values:
         name_col = _name_like_column(schema, iv.table_hint)
         if name_col is None:
@@ -210,13 +239,16 @@ def _build_where(
         _record(
             iv.table_hint,
             name_col.name,
-            exp.EQ(
-                this=_column_ref(iv.table_hint, name_col.name),
-                expression=_literal(iv.value),
+            _string_match(
+                _column_ref(iv.table_hint, name_col.name),
+                iv.value,
+                dialect=dialect,
+                exact=False,
             ),
         )
 
     # Quoted strings → prefer primary-table string columns, fall back to any.
+    # User wrote them with quotes — that's the explicit "exact match" signal.
     primary_cols = [m for m in columns if m.table.lower() == primary.lower()]
     any_cols = columns
     for qv in list(values.quoted):
@@ -230,9 +262,9 @@ def _build_where(
                     _record(
                         m.table,
                         m.column,
-                        exp.EQ(
-                            this=_column_ref(m.table, m.column),
-                            expression=_literal(qv),
+                        _string_match(
+                            _column_ref(m.table, m.column), qv,
+                            dialect=dialect, exact=True,
                         ),
                     )
                     bound = True
@@ -589,7 +621,8 @@ def build(
     # WHERE — cross-table allowed. Any secondary tables the WHERE touches get
     # added to `referenced_tables` before joins are resolved.
     where, used_for_where, extra_where_tables = _build_where(
-        schema, primary, column_matches, values, implicit_values
+        schema, primary, column_matches, values, implicit_values,
+        dialect=dialect,
     )
     if where is not None:
         select = select.where(where, copy=False)
