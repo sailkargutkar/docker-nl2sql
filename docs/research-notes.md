@@ -1977,3 +1977,120 @@ no second table won't satisfy them. The negative-case tests in
 93e517c  feat(phase-16): top-K alternatives — generator + API + UI panel
 [next]   feat(phase-16a): multi-table LIST — JOIN when "X with their Y"
 ```
+
+---
+
+## Phase 16b — auto-annotation on add/regenerate + progressive UX
+
+After Phase 16a shipped, the user added a second feedback round: the
+matcher routed correctly but the schema was *not* annotated when added
+through the UI, so synonyms were sparse and the experience felt
+"unfinished" until a separate `tools/auto_annotate.py` run. The fix:
+make annotation part of the add/regenerate flow itself, with proper
+loading-state UX so the user sees the analysis happening.
+
+### Backend changes
+
+**New** `app/annotate.py`: deterministic annotator that mirrors
+`tools/auto_annotate.py` but:
+- Uses **PyYAML** (already in main `requirements.txt`) instead of
+  `ruamel.yaml` (dev-only) — fine because we annotate freshly
+  introspected files that have no comments to preserve.
+- Re-uses the acronym tables from `app/nlp/_acronyms.py` (moved from
+  `tools/_acronyms.py`; tools/ keeps a 1-line shim for backward compat).
+- Idempotent: a second run on already-annotated content is a no-op.
+- Preserves manually-edited descriptions and synonyms.
+
+**`app/main.py`**:
+- `POST /api/databases` — after `schema_introspect.generate_and_write`,
+  call `annotate.annotate_yaml_in_place(schema_path)`. Failure is
+  non-fatal (logged but ignored — the schema is still usable).
+- `POST /api/databases/{name}/regenerate` — same.
+- `POST /api/databases/{name}/activate` — pre-warms the schema cache
+  by calling `get_schema(...)` synchronously, so the first `/api/ask`
+  after activation isn't bottlenecked on YAML parsing. Returns
+  `schema_warmed` and `tables_loaded` in the response so the UI can
+  show "X tables loaded".
+
+### Frontend changes
+
+**Add-database flow**:
+- New `_cycleAddStatus()` cycles through 5 progressive messages on a
+  1.2s timer while the API call is in flight:
+  1. "Connecting to database…"
+  2. "Reading schema (introspecting tables and columns)…"
+  3. "Analyzing column names — generating descriptions and synonyms…"
+  4. "Caching the analyzed schema…"
+  5. "Almost ready…"
+- Final status: `added ✓ (N tables analyzed)` from the API response's
+  `table_count`.
+- Spinner stays visible the entire time — no dead air during the 2-5s
+  introspection+annotation.
+
+**Activate / regenerate flow**:
+- `dbAction()` now picks per-action stage messages:
+  - activate: "switching active database…" → "loading schema…" → "warming cache…"
+  - regenerate: "re-reading database schema…" → "analyzing column names…" → "generating synonyms…"
+- Page-level meta banner also shows the activity (`"switching to bombayhouse…"`)
+  so the user sees state transition outside just the modal.
+- Spinners + ticker continue to update on a 0.9s timer until the API
+  call resolves or errors.
+
+### Test coverage
+
+**`tests/test_annotate_on_add.py` — 9 new tests:**
+
+`TestAnnotator` (6):
+- Acronym synonyms picked up for GSTIN, PAN
+- camelCase humanized to "payment term"
+- PK description is "Primary key — …"
+- FK description is "Foreign key to …"
+- Synonyms don't collide with other columns on the same table
+
+`TestAnnotateYamlInPlace` (3):
+- Round-trip adds synonyms to GSTIN/paymentTerm but not to id (PK) or
+  createdAt (bookkeeping)
+- Idempotent: second run ≡ first
+- Existing manually-edited descriptions preserved
+
+**Total suite: 120/120 passing** (was 111; +9).
+
+### Live verification (bombayhouse, 77 tables)
+
+After `POST /api/databases` for a fresh DB, the resulting YAML
+contains rich annotations like:
+
+```yaml
+- name: products
+  description: Products.
+  columns:
+  - name: id
+    description: Primary key — id.
+  - name: name
+    description: name — free-text value.
+    synonyms:
+    - title
+    - label
+    - products name
+  - name: GSTIN
+    description: GSTIN — gst number.
+    synonyms:
+    - gst number
+    - gst id
+    - tax id
+    - tax registration
+    - vat
+```
+
+…all generated **inline** during the add-database call, no second step.
+
+### What this unblocks
+
+- New users register a DB once and immediately get good NL coverage —
+  no longer "add → run a separate tool → re-test".
+- The existing `tools/auto_annotate.py` CLI still works for power
+  users who want `--verbose` / `--mode replace` / dry-run. It now
+  imports the acronym tables from `app/nlp/_acronyms.py` (single
+  source of truth).
+- Acronym additions go in **one place** (`app/nlp/_acronyms.py`) and
+  immediately benefit both the runtime add path and the dev tool.

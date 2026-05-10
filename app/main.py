@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 
-from . import db_registry, history, schema_dsl, schema_introspect
+from . import annotate, db_registry, history, schema_dsl, schema_introspect
 from .config import settings
 from .executor import execute
 from .generator import generate_alternatives, generate_sql, reset_classifier
@@ -398,6 +398,15 @@ def add_database(req: DatabaseCreate) -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"Schema generation failed: {e}") from e
 
+    # Auto-annotate the freshly-introspected schema with descriptions and
+    # synonyms — deterministic, no LLM, runs in well under a second even
+    # on 100+-table schemas. Failure here is non-fatal (the schema is
+    # still usable, just without the synonym richness).
+    try:
+        annotate.annotate_yaml_in_place(schema_path)
+    except Exception:  # noqa: BLE001
+        pass
+
     entry = db_registry.insert(
         settings.registry_db,
         name=req.name,
@@ -425,7 +434,24 @@ def activate_database(name: str) -> dict[str, Any]:
         raise HTTPException(404, f"No database named '{name}'.")
     db_registry.set_active(settings.registry_db, name)
     invalidate_cache()
-    return {"item": db_registry.get_by_name(settings.registry_db, name).to_public_dict()}  # type: ignore[union-attr]
+
+    # Pre-warm the schema cache so the user's first /api/ask after
+    # activation isn't bottlenecked on YAML parsing. Failure is
+    # non-fatal — get_schema is lazy, /api/ask will retry.
+    warmed_tables = 0
+    try:
+        warmed_schema = get_schema(entry.schema_file)
+        warmed_tables = len(warmed_schema.tables)
+    except Exception:  # noqa: BLE001
+        pass
+
+    item = db_registry.get_by_name(settings.registry_db, name)
+    assert item is not None
+    return {
+        "item": item.to_public_dict(),
+        "schema_warmed": warmed_tables > 0,
+        "tables_loaded": warmed_tables,
+    }
 
 
 @app.post("/api/databases/{name}/regenerate")
@@ -440,6 +466,14 @@ def regenerate_database(name: str) -> dict[str, Any]:
         )
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"Schema generation failed: {e}") from e
+
+    # Same auto-annotation step on regenerate so the matcher gets a
+    # synonym-rich schema without a separate manual step.
+    try:
+        annotate.annotate_yaml_in_place(Path(entry.schema_file))
+    except Exception:  # noqa: BLE001
+        pass
+
     db_registry.update_table_count(settings.registry_db, name, count)
     invalidate_cache()
     return {"item": db_registry.get_by_name(settings.registry_db, name).to_public_dict()}  # type: ignore[union-attr]

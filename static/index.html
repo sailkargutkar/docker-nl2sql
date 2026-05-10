@@ -386,20 +386,49 @@ async function loadDbList() {
 async function dbAction(act, name, btn) {
   const label = btn.textContent;
   btn.disabled = true;
-  btn.innerHTML = `<span class="spinner"></span>${act === 'regenerate' ? 'regenerating…' : act + '…'}`;
+  // Map action → user-friendly progressive label.
+  const stages = {
+    activate: ['switching active database…', 'loading schema…', 'warming cache…'],
+    regenerate: ['re-reading database schema…', 'analyzing column names…', 'generating synonyms…'],
+    delete: ['removing…'],
+  }[act] || [act + '…'];
+  let i = 0;
+  btn.innerHTML = `<span class="spinner"></span>${stages[0]}`;
+  const ticker = setInterval(() => {
+    i = Math.min(i + 1, stages.length - 1);
+    btn.innerHTML = `<span class="spinner"></span>${stages[i]}`;
+  }, 900);
+
+  // Page-level banner so the rest of the UI can show "analysing…"
+  const wasMeta = $('#meta').textContent;
+  if (act === 'activate' || act === 'regenerate') {
+    $('#meta').innerHTML = `<span class="spinner"></span>${
+      act === 'activate'
+        ? `switching to ${escape(name)}…`
+        : `re-analyzing ${escape(name)}…`
+    }`;
+  }
   try {
-    if (act === 'activate') await fetchJSON(`/api/databases/${encodeURIComponent(name)}/activate`, { method: 'POST' });
-    else if (act === 'regenerate') await fetchJSON(`/api/databases/${encodeURIComponent(name)}/regenerate`, { method: 'POST' });
-    else if (act === 'delete') {
+    let res;
+    if (act === 'activate') {
+      res = await fetchJSON(`/api/databases/${encodeURIComponent(name)}/activate`, { method: 'POST' });
+    } else if (act === 'regenerate') {
+      res = await fetchJSON(`/api/databases/${encodeURIComponent(name)}/regenerate`, { method: 'POST' });
+    } else if (act === 'delete') {
       if (!confirm(`Remove database config '${name}'? (Does not touch the actual database.)`)) {
-        btn.disabled = false; btn.textContent = label; return;
+        clearInterval(ticker);
+        btn.disabled = false; btn.textContent = label;
+        $('#meta').textContent = wasMeta;
+        return;
       }
       await fetchJSON(`/api/databases/${encodeURIComponent(name)}`, { method: 'DELETE' });
     }
     await Promise.all([loadDbList(), loadMeta()]);
   } catch (e) {
     alert(e.message);
+    $('#meta').textContent = wasMeta;
   } finally {
+    clearInterval(ticker);
     btn.disabled = false; btn.textContent = label;
   }
 }
@@ -421,6 +450,27 @@ $('#f-dialect').addEventListener('change', () => {
   }
 });
 
+// Progressive status messages while the backend runs through the
+// connect → introspect → annotate → activate stages. The backend is
+// fully synchronous on /api/databases — the messages cycle locally on
+// a timer to give the user visibility into each phase. Total wall time
+// is usually < 3s; on 100+-table schemas around 5s.
+function _cycleAddStatus() {
+  const stages = [
+    'Connecting to database…',
+    'Reading schema (introspecting tables and columns)…',
+    'Analyzing column names — generating descriptions and synonyms…',
+    'Caching the analyzed schema…',
+    'Almost ready…',
+  ];
+  let i = 0;
+  $('#addStatus').innerHTML = `<span class="spinner"></span>${stages[0]}`;
+  return setInterval(() => {
+    i = Math.min(i + 1, stages.length - 1);
+    $('#addStatus').innerHTML = `<span class="spinner"></span>${stages[i]}`;
+  }, 1200);
+}
+
 $('#addDb').onclick = async () => {
   const payload = {
     name: $('#f-name').value.trim(),
@@ -436,9 +486,9 @@ $('#addDb').onclick = async () => {
     $('#addStatus').textContent = 'fill all required fields'; return;
   }
   $('#addDb').disabled = true;
-  $('#addStatus').innerHTML = '<span class="spinner"></span>connecting & introspecting schema…';
+  const cycler = _cycleAddStatus();
   try {
-    await fetchJSON('/api/databases', {
+    const res = await fetchJSON('/api/databases', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify(payload),
     });
@@ -446,13 +496,17 @@ $('#addDb').onclick = async () => {
       if (id === 'f-port') $('#'+id).value = $('#f-dialect').value === 'mysql' ? 3306 : 5432;
       else $('#'+id).value = '';
     });
-    $('#addStatus').textContent = 'added ✓';
+    const tables = res?.item?.table_count ?? '?';
+    $('#addStatus').textContent = `added ✓ (${tables} tables analyzed)`;
     await Promise.all([loadDbList(), loadMeta()]);
   } catch (e) {
     $('#addStatus').innerHTML = `<span style="color: var(--err);">${escape(e.message)}</span>`;
   } finally {
+    clearInterval(cycler);
     $('#addDb').disabled = false;
-    setTimeout(() => { if ($('#addStatus').textContent === 'added ✓') $('#addStatus').textContent = ''; }, 3000);
+    setTimeout(() => {
+      if ($('#addStatus').textContent.startsWith('added ✓')) $('#addStatus').textContent = '';
+    }, 4000);
   }
 };
 
