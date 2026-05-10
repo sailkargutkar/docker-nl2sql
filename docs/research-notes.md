@@ -2158,3 +2158,116 @@ contains rich annotations like:
   source of truth).
 - Acronym additions go in **one place** (`app/nlp/_acronyms.py`) and
   immediately benefit both the runtime add path and the dev tool.
+
+---
+
+## Phase 16c — implicit-value bug fixes (preposition leakage + value-before-table)
+
+User regression on bombayhouse:
+
+```
+Q: List all products under the Pizza category
+Got: WHERE products.name = 'under Pizza'    ← two bugs:
+                                              (1) "under" leaked into the literal
+                                              (2) bound to products.name; should be categories.name
+Want: WHERE categories.name = 'Pizza'
+```
+
+### Fix 1 — `_CONNECTIVE_WORDS` expanded
+
+`app/nlp/implicit.py` adds these to the connective set so they no
+longer survive as multi-word value tokens:
+
+- **Spatial / categorical prepositions**: `under`, `above`, `below`,
+  `between`, `through`, `via`
+- **Temporal markers**: `before`, `after`, `since`
+- **Demonstratives**: `this`, `that`, `these`, `those`
+- **SQL action verbs**: `show`, `list`, `find`, `get`, `give`, `fetch`,
+  `display`, `return`, `count`, `total`, `sum`, `average`, `max`,
+  `min`, `top`, `first`, `last`, `search`, `select`, `tell`, `say`,
+  `want`, `need`, plus copulae (`is/are/was/were`, `has/have/had`,
+  `do/does/did`)
+
+Without the action-verb additions, my new Pattern 3 (below) would have
+fired on "list products" → emit `ImplicitValue(products, 'list')`.
+
+### Fix 2 — Pattern 3: value-before-table (head-noun convention)
+
+The existing detector only handled `<table> <value>` (e.g.
+"client acme" → `Client.name='acme'`). English also commonly puts the
+value FIRST: "Pizza category", "London office", "VIP customers".
+
+New pattern fires when:
+- Current token is a table-hint
+- IMMEDIATELY preceding token (and any earlier ones) are value
+  candidates and not yet consumed by another pattern
+
+It walks BACKWARDS from the table to collect a multi-word value:
+"shrimp Pizza category" → `categories.name = 'shrimp Pizza'`.
+
+### Disambiguation: `<table-A> <value> <table-B>`
+
+This shape is genuinely ambiguous in English:
+
+| Phrase | Intent |
+|---|---|
+| "products in Snacks category" | categories.name='Snacks' (Pattern 3) |
+| "users in org swaraj of client acme" | org.name='swaraj' AND client.name='acme' (both Pattern 1) |
+
+Heuristic implemented:
+
+> Defer Pattern 1 to Pattern 3 only when the NEXT table doesn't have
+> its own value at i+3. If table-B has its own value too (e.g. "client
+> acme"), then table-A's value is genuinely table-A's; Pattern 1 fires
+> for both.
+
+So for `[product, swaraj, client, acme]`:
+- At "product": next table is "client", and client has "acme" after it.
+  → Pattern 1 fires: `(product, 'swaraj')` (or whatever — see test).
+- At "client": Pattern 1 fires: `(client, 'acme')`.
+
+For `[product, Snacks, category]`:
+- At "product": next table is "category" (no value at i+3 — out of bounds).
+  → Pattern 1 deferred.
+- At "category": Pattern 3 fires: `(categories, 'Snacks')`.
+
+### `consumed` set tracks token positions
+
+Both Pattern 1 and Pattern 3 add to a `consumed: set[int]`; subsequent
+iterations skip consumed positions. Prevents the same token from being
+re-bound by a later pattern.
+
+### Live verification (bombayhouse)
+
+```
+Q: List all products under the Pizza category
+   SQL: SELECT categories.id, categories.name, …, products.id, products.name, …
+        FROM categories
+        INNER JOIN products ON categories.id = products.category
+        WHERE categories.name = 'Pizza'
+        LIMIT 500                       ← exactly the user's intent ✅
+
+Q: products in Snacks category          → WHERE categories.name = 'Snacks' ✅
+Q: products in Snacks                   → WHERE products.name = 'Snacks' ✅
+                                          (no second table; Pattern 1)
+Q: Pizza category items                 → WHERE categories.name = 'Pizza' ✅
+                                          (value-before-table)
+```
+
+### Tests (`tests/test_value_before_table.py` — 8 new)
+
+- `TestConnectivesSuppressPrepositions` (3): `under`, `list`, `show`
+  must not be value candidates.
+- `TestValueBeforeTablePattern` (4): "Pizza category", "products in
+  Snacks category", full phrase end-to-end, Pattern 1 still fires
+  when there's no trailing table.
+- `TestPatternPrecedence` (1): both patterns can fire on the same
+  query when both tables have their own values.
+
+**128 / 128 tests passing** (was 120; +8).
+
+### Cumulative ship log entry
+
+```
+[next]   feat(phase-16c): connective expansion + value-before-table pattern
+```

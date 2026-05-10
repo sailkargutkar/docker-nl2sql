@@ -37,6 +37,20 @@ _CONNECTIVE_WORDS = {
     # Negation markers — these never refer to a literal value; the
     # negative-predicate logic in values.extract() handles them.
     "no", "not", "without", "any", "all",
+    # Spatial / categorical prepositions. "products under the Pizza
+    # category" — `under` is the relation marker, not part of the value.
+    "under", "above", "below", "between", "through", "via",
+    # Temporal markers commonly preceding values
+    "before", "after", "since",
+    # Demonstratives / determiners that survived stopword removal
+    "this", "that", "these", "those",
+    # SQL action / aggregation verbs — never literals, even when adjacent
+    # to a table token (otherwise "list products" emits ImplicitValue with
+    # value='list', and Pattern 3 below would do the same on "list" + table).
+    "show", "list", "find", "get", "give", "fetch", "display", "return",
+    "count", "total", "sum", "average", "max", "min", "top", "first", "last",
+    "search", "select", "tell", "say", "want", "need",
+    "is", "are", "was", "were", "has", "have", "had", "do", "does", "did",
 }
 
 
@@ -155,21 +169,68 @@ def detect(pre: Preprocessed, schema: Schema) -> list[ImplicitValue]:
             return False
         return True
 
+    consumed: set[int] = set()
     i = 0
     while i < len(tokens):
+        if i in consumed:
+            i += 1
+            continue
         tok = tokens[i]
 
-        # Pattern 1: <table-word> <value>
+        # Pattern 1: <table-word> <value...>
+        # BUT defer to Pattern 3 (later iteration) when the value is
+        # sandwiched as <table-A> <value> <table-B> AND table-B has no
+        # value of its own at (i+3). That's the head-noun shape:
+        #   "products in Snacks category"   → defer (Snacks → categories)
+        #   "users in org X of client Y"    → fire (X → org, then Y → client)
         table = table_by_lemma.get(tok.lemma)
         if table and i + 1 < len(tokens) and _is_value_candidate(i + 1):
-            value_parts = [tokens[i + 1].raw]
-            j = i + 2
-            while j < len(tokens) and _is_value_candidate(j):
-                value_parts.append(tokens[j].raw)
-                j += 1
-            out.append(ImplicitValue(table_hint=table, value=" ".join(value_parts)))
-            i = j
-            continue
+            value_after = tokens[i + 1]
+            next_table_pos = (
+                i + 2 if i + 2 < len(tokens) and table_by_lemma.get(tokens[i + 2].lemma)
+                else None
+            )
+            next_table_has_own_value = (
+                next_table_pos is not None
+                and next_table_pos + 1 < len(tokens)
+                and _is_value_candidate(next_table_pos + 1)
+            )
+            defer_to_pattern_3 = (
+                next_table_pos is not None and not next_table_has_own_value
+            )
+            if not defer_to_pattern_3:
+                value_parts = [value_after.raw]
+                j = i + 2
+                while j < len(tokens) and _is_value_candidate(j):
+                    value_parts.append(tokens[j].raw)
+                    j += 1
+                out.append(ImplicitValue(table_hint=table, value=" ".join(value_parts)))
+                consumed.update(range(i, j))
+                i = j
+                continue
+
+        # Pattern 3: <value...> <table-word> — value precedes the table.
+        # Catches phrasings like "Pizza category" → categories.name='Pizza',
+        # "London office" → office.name='London', etc.
+        if (
+            table
+            and i > 0
+            and (i - 1) not in consumed
+            and _is_value_candidate(i - 1)
+        ):
+            j = i - 1
+            value_parts: list[str] = []
+            while j >= 0 and j not in consumed and _is_value_candidate(j):
+                value_parts.insert(0, tokens[j].raw)
+                j -= 1
+            if value_parts:
+                out.append(ImplicitValue(
+                    table_hint=table,
+                    value=" ".join(value_parts),
+                ))
+                consumed.update(range(j + 1, i + 1))
+                i += 1
+                continue
 
         # Pattern 2: named/called <value> — inferred table from context.
         if tok.lemma in _INTRO_WORDS and i + 1 < len(tokens) and _is_value_candidate(i + 1):
