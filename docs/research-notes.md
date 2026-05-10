@@ -449,22 +449,44 @@ Total: ~810 lines + tests. No new heavy deps. Image stays ~300 MB.
 
 ## Already shipped on `feature/self-sustaining-nl2sql`
 
-Branch contains the LLM-free baseline plus three early refinements:
+This section is the quick orientation for anyone landing in the doc;
+the full chronological log is in **Cumulative ship log (this branch)**
+much further down.
 
-- **Commit `35a378e`**: initial self-sustaining nl2sql
-  - FastAPI service, sqlglot validator, read-only Postgres executor
-  - TF-IDF intent classifier + LinearSVC, retrains from `history.db`
-  - rapidfuzz + WordNet schema matcher
-  - Template SQL builder via sqlglot AST
-  - 45 tests pass
+**Foundation (Phases 1–2):**
+- `35a378e` — initial LLM-free baseline (FastAPI, sqlglot validator,
+  Postgres read-only executor, TF-IDF intent classifier, rapidfuzz +
+  WordNet matcher, sqlglot AST builder; 45 tests).
+- `1bf17db` — implicit values (`org swaraj`), cross-table WHERE,
+  `total <plural>` heuristic; 54 tests.
 
-- **Commit `1bf17db`**: implicit values, cross-table WHERE, "total X" intent
-  - `app/nlp/implicit.py` — unquoted-literal detection (`org swaraj`)
-  - Cross-table WHERE with auto-join
-  - Regex+seed override for `total <plural>` → count
-  - 54 tests pass
+**Build-time tooling, then deterministic pivot (Phases 3–7):**
+- `3d6a900` — LLM-as-build-oracle infrastructure (annotate_schema CLI).
+- `fb4f7ef` — **deterministic schema annotator** + matcher control-verb
+  filter + bigram synonyms. **LLM tooling becomes opt-in here.**
 
-The four-stage plan above is what comes next.
+**Multi-dialect runtime + stress-test tuning (Phases 11–15):**
+- `dd73a1e` — MySQL support (dialect-aware executor / validator /
+  builder / introspection / URL builder / DatabaseEntry).
+- `c43d343` — UI dialect selector (Engine dropdown, port auto-flip).
+- `bbe0e03` — MariaDB compat in executor (`max_statement_time` fallback).
+- `cb63a8e` — length-gated lower fuzzy threshold (`categris→category`).
+- `60e9a9e` — Phase 14 fixes: typo'd literals, exists intent, boolean
+  filter regression.
+- `45c07e7` — Phase 15: compound-name split (`onlineorders` →
+  `online + orders`), boolean auto-TRUE on "are X" / "is X", and
+  `IS NULL` for "without Y" / "no Y" patterns.
+
+**Stage 1 (sketch + repair) — incremental roll-out (Phases 16, 16a, 16b):**
+- `93e517c` — Phase 16: top-K alternatives (generator + `AskResponse`
+  field + UI panel).
+- `424dd50` — Phase 16a: multi-table LIST JOIN when "X with their Y".
+- `a227ea2` — **Phase 16b**: inline auto-annotation on add/regenerate +
+  progressive UI loaders. **120 tests passing.**
+
+**What comes next**: Phase 17 (explicit Sketch IR + repair tactics +
+execution-guided ranking), then Phase 18 (`/api/teach` endpoint closing
+the MISP feedback loop). See **Open items / next decisions** lower down.
 
 ---
 
@@ -1269,20 +1291,50 @@ is a one-liner — pending user direction.
 
 ## Cumulative ship log (this branch)
 
-| Commit | Type | Summary |
-|---|---|---|
-| `35a378e` | feat | initial self-sustaining nl2sql baseline |
-| `1bf17db` | feat | implicit values, cross-table WHERE, "total X" intent |
-| `b5a7db6` | docs | research notes A–G consolidated |
-| `54e4df5` | docs | per-paper attribution conclusion |
-| `4921b3b` | docs | UI wireframes for the four-stage system |
-| `811a956` | docs | improvement analysis + LLM-as-build-oracle pivot |
-| `4298a0d` | docs | tool design — error-checked, with corrections |
-| `3d6a900` | feat | LLM-as-build-oracle infrastructure + annotate_schema |
-| `fb4f7ef` | feat | **deterministic schema annotator (no LLM, no cost)** |
+Read top → bottom for chronological order. Full per-phase detail
+is in the `Phase NN — …` sections lower down.
 
-The `fb4f7ef` commit is the inflection point — after that, the build-time
-LLM tools become **opt-in** rather than the recommended default.
+| # | Commit | Type | Summary |
+|---|---|---|---|
+| 1 | `35a378e` | feat | initial self-sustaining nl2sql baseline |
+| 2 | `1bf17db` | feat | implicit values, cross-table WHERE, "total X" intent |
+| 3 | `b5a7db6` | docs | research notes A–G consolidated |
+| 4 | `54e4df5` | docs | per-paper attribution conclusion |
+| 5 | `4921b3b` | docs | UI wireframes for the four-stage system |
+| 6 | `811a956` | docs | improvement analysis + LLM-as-build-oracle pivot |
+| 7 | `4298a0d` | docs | tool design — error-checked, with corrections |
+| 8 | `3d6a900` | feat | LLM-as-build-oracle infrastructure + annotate_schema |
+| 9 | `fb4f7ef` | feat | **deterministic schema annotator (no LLM, no cost)** ← LLM-tooling becomes opt-in here |
+| 10 | `613e051` | docs | full session journey (Phases 1-13) |
+| 11 | `dd73a1e` | feat | **MySQL support** — dialect-aware runtime + introspection helper |
+| 12 | `c43d343` | feat | UI dialect selector + dialect-aware tests + docs |
+| 13 | `bbe0e03` | feat | **MariaDB compat** in executor (`max_statement_time` fallback) + jodhpur e2e schema |
+| 14 | `cb63a8e` | feat | matcher: length-gated lower fuzzy threshold + 22-query stress-test docs (Phase 13) |
+| 15 | `60e9a9e` | fix | Phase 14 — typo'd literals, exists intent, boolean filter |
+| 16 | `45c07e7` | feat | Phase 15 — compound split + bool auto-TRUE + negative-exists IS NULL |
+| 17 | `93e517c` | feat | **Phase 16 — top-K alternatives** (generator + API + UI panel) |
+| 18 | `424dd50` | feat | Phase 16a — multi-table LIST (`X with their Y` JOIN) |
+| 19 | `a227ea2` | feat | **Phase 16b — inline auto-annotation on add + progressive UX loaders** |
+
+Two inflection points worth flagging:
+
+- **`fb4f7ef`** — moment the project decided to stop relying on
+  build-time LLM tooling. Everything after this is fully deterministic.
+- **`93e517c`** — start of the **Stage 1 (sketch + repair)** roll-out.
+  Phase 16 / 16a / 16b are all increments of the same broader plan;
+  Phase 17 will land the explicit Sketch IR + repair tactics.
+
+### Test-count progression
+
+| After commit | Tests passing |
+|---|---|
+| `1bf17db` (Phase ≤ 2) | 54 |
+| `cb63a8e` (Phase 13) | 72 |
+| `60e9a9e` (Phase 14) | 79 |
+| `45c07e7` (Phase 15) | 97 |
+| `93e517c` (Phase 16) | 105 |
+| `424dd50` (Phase 16a) | 111 |
+| `a227ea2` (Phase 16b) | **120** |
 
 ---
 
@@ -1300,16 +1352,28 @@ LLM tools become **opt-in** rather than the recommended default.
 
 ## Open items / next decisions
 
-| Item | Status | Owner |
+Updated through `a227ea2` (Phase 16b). Everything in earlier versions
+of this section that's now done has been moved to the Cumulative ship
+log above.
+
+| Item | Status | Notes |
 |---|---|---|
-| Stage 1 — sketch + repair loop (Paper B) | Not started | next ship |
-| Stage 2 — execution-guided + multi-component scoring | Not started | after Stage 1 |
-| Stage 3 — DB content value matching (Paper A.T1a) | Not started | after Stage 1 |
-| Stage 4 — MISP top-K UI | Not started | after Stage 1 |
-| SER metric (Paper G) | Not started | bonus, any time |
-| Auto-annotate the remaining 88 tables | Run-when-ready (it's free) | user choice |
-| Commit author identity | Currently `sailwemotive`; can change to `sailkargutkar` per user preference | pending direction |
-| Deterministic active-labeling loop | Pattern same as MISP — likely covered when Stage 4 ships | with Stage 4 |
+| Stage 1 — sketch + repair loop (Paper B) | **In progress** | Phase 16 (top-K alternatives) and 16a (multi-table LIST) and 16b (inline annotation) shipped as increments. Phase 17 = explicit Sketch IR + repair tactics. |
+| Stage 2 — execution-guided + multi-component scoring | Not started | Will land alongside Phase 17 — the multi-component scoring (Paper D) needs the candidate set Phase 17's repair loop produces. |
+| Stage 3 — DB content value matching (Paper A.T1a) | Not started | Independent — could ship before Phase 17 if priorities shift. |
+| Stage 4 — MISP top-K UI | **Partial** | UI panel for "Other interpretations" already shipped in Phase 16. Remaining: `/api/teach` endpoint that captures user's pick → next retrain weights it as a labelled training row. That's Phase 18. |
+| SER metric (Paper G) | Not started | ~15-line instrumentation for `/api/health`. Bonus, any time. |
+| Auto-annotate when adding a DB | **Done** Phase 16b | Inline in `POST /api/databases`. Progressive UI loaders included. |
+| Commit author identity | Still `sailwemotive` | Pending user direction; commits push fine via the working `21238971` token (sailkargutkar's PAT). |
+| Deterministic active-labeling loop | Folded into Stage 4 (Phase 18) | When user clicks "Use this" on an alternative, that pick becomes a labelled training row. |
+| GROUP BY / HAVING / time-bucket intents | Not started | Surfaced in Phase-13 stress test as a coverage gap; useful for analytical queries ("X by month", "per client"). |
+| Sentence-embedding intent classifier (replace TF-IDF) | Not started | Improvement #2 from the analysis section. Adds ~80 MB but catches semantic synonyms WordNet misses. |
+
+### Phases planned next (in order)
+
+1. **Phase 17** — Sketch IR + repair tactics + execution-guided ranking. The architectural change SQLizer's paper described. ~500 lines + tests. Big win for queries that don't fit the current builder's templates.
+2. **Phase 18** — `/api/teach` endpoint closing the MISP feedback loop. ~80 lines + UI tweak. Makes the system *truly* self-improving from real user clicks.
+3. **Phase 19** (optional) — GROUP BY / time-range parser (highest-ROI from the improvement analysis). ~200 lines. Unlocks dashboard-style analytical queries.
 
 ---
 
